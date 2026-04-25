@@ -15,8 +15,8 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="Weather Edge Pro",
-    page_icon="🌡️",
+    page_title="Weather Exact Edge",
+    page_icon="🎯",
     layout="wide",
 )
 
@@ -24,7 +24,7 @@ OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
-HEADERS = {"User-Agent": "weather-edge-pro-streamlit/2.0"}
+HEADERS = {"User-Agent": "weather-exact-edge-streamlit/3.0"}
 
 MODELS = {
     "Best Match Open-Meteo": "best_match",
@@ -333,7 +333,7 @@ def robust_mad(values):
 def base_forecast_error(horizon_days):
     """
     Piso conservador de erro para Tmax diária.
-    Não é validação oficial; é uma proteção contra excesso de confiança.
+    Não é validação oficial; é proteção contra excesso de confiança.
     """
     h = max(0, int(horizon_days))
     return 0.95 + 0.17 * h + (0.20 if h >= 5 else 0.0) + (0.25 if h >= 10 else 0.0)
@@ -345,9 +345,9 @@ def scale_0_100(x, low, high):
     return float(np.clip(100 * (x - low) / (high - low), 0, 100))
 
 
-def probability_from_normal(mu, sigma, line_c):
+def interval_probability_normal(mu, sigma, lower, upper):
     dist = NormalDist(mu=mu, sigma=max(0.01, sigma))
-    return 1.0 - dist.cdf(line_c)
+    return max(0.0, min(1.0, dist.cdf(upper) - dist.cdf(lower)))
 
 
 def simulate_temperature_distribution(
@@ -357,7 +357,7 @@ def simulate_temperature_distribution(
     error_floor,
     seasonal_error,
     risk_multiplier,
-    n_samples=40000,
+    n_samples=50000,
 ):
     rng = np.random.default_rng(42)
 
@@ -378,7 +378,7 @@ def simulate_temperature_distribution(
         size=n_samples,
     )
 
-    # Cauda pesada: alguns dias têm erro sistemático local, estação diferente ou evento convectivo.
+    # Cauda pesada: erro de estação, microclima, regra de resolução ou atualização de modelo.
     tail_event = rng.random(n_samples) < 0.08
     tail_noise = rng.normal(
         loc=0.0,
@@ -389,7 +389,52 @@ def simulate_temperature_distribution(
     return centers + normal_noise + tail_event * tail_noise
 
 
-def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile, resolution_risk):
+def build_exact_buckets_from_distribution(simulated, half_width, min_center=None, max_center=None):
+    step = 2 * half_width
+    if step <= 0:
+        step = 1.0
+
+    # Para mercados em grau inteiro: centros ..., 23, 24, 25, ...
+    # Para mercados em décima: half_width=0.05, centros ..., 24.8, 24.9, 25.0, ...
+    decimals = 0 if step >= 0.999 else 1 if step >= 0.099 else 2
+
+    if min_center is None:
+        min_center = math.floor(np.percentile(simulated, 0.3) / step) * step
+    if max_center is None:
+        max_center = math.ceil(np.percentile(simulated, 99.7) / step) * step
+
+    centers = np.arange(min_center, max_center + step / 2, step)
+    rows = []
+    n = len(simulated)
+
+    for center in centers:
+        lower = center - half_width
+        upper = center + half_width
+        p = float(np.mean((simulated >= lower) & (simulated < upper)))
+        rows.append(
+            {
+                "Temperatura": round(float(center), decimals),
+                "Intervalo": f"[{lower:.2f}, {upper:.2f}) °C",
+                "Probabilidade": p,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values("Probabilidade", ascending=False).reset_index(drop=True)
+    df["Ranking"] = np.arange(1, len(df) + 1)
+    return df
+
+
+def analyse_exact_temperature(
+    forecasts,
+    climatology,
+    target_day,
+    target_temp_c,
+    half_width_c,
+    yes_price,
+    risk_profile,
+    resolution_risk,
+):
     values = forecasts["tmax"].to_numpy(dtype=float)
     weights = forecasts["peso"].to_numpy(dtype=float)
     n_models = len(values)
@@ -412,7 +457,6 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         clim_std = float(climatology["tmax"].std(ddof=1))
         clim_percentile = float((climatology["tmax"] <= ensemble_center).mean())
 
-    # Quanto mais longe, mais a previsão é puxada para a climatologia histórica.
     if clim_mean is not None and not math.isnan(clim_mean):
         forecast_weight = 1.0 / (1.0 + (horizon / 16.0) ** 2)
         final_mean = forecast_weight * ensemble_center + (1.0 - forecast_weight) * clim_mean
@@ -434,7 +478,10 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
     ) * risk_multiplier
     sigma = max(0.85, sigma)
 
-    p_normal_yes = probability_from_normal(final_mean, sigma, line_c)
+    lower = target_temp_c - half_width_c
+    upper = target_temp_c + half_width_c
+
+    p_normal_yes = interval_probability_normal(final_mean, sigma, lower, upper)
 
     simulated = simulate_temperature_distribution(
         forecasts=forecasts,
@@ -444,20 +491,21 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         seasonal_error=seasonal_error,
         risk_multiplier=risk_multiplier,
     )
-    p_mc_yes = float(np.mean(simulated >= line_c))
 
-    # Probabilidade usada no semáforo: mistura e depois aplica haircut conservador.
-    p_blend_yes = 0.55 * p_normal_yes + 0.45 * p_mc_yes
-    uncertainty_haircut = 0.015 + 0.006 * horizon + 0.015 * max(0, 5 - n_models)
-    uncertainty_haircut += 0.020 if model_spread > 1.5 else 0.0
-    uncertainty_haircut += 0.025 if model_spread > 2.2 else 0.0
-    uncertainty_haircut += 0.010 * resolution_risk
+    p_mc_yes = float(np.mean((simulated >= lower) & (simulated < upper)))
+    p_blend_yes = 0.45 * p_normal_yes + 0.55 * p_mc_yes
+
+    # Haircut conservador mais leve que no mercado over/under, porque buckets exatos já têm probabilidade baixa.
+    uncertainty_haircut = 0.006 + 0.0025 * horizon + 0.006 * max(0, 5 - n_models)
+    uncertainty_haircut += 0.010 if model_spread > 1.5 else 0.0
+    uncertainty_haircut += 0.015 if model_spread > 2.2 else 0.0
+    uncertainty_haircut += 0.004 * resolution_risk
 
     p_cons_yes = float(np.clip(p_blend_yes - uncertainty_haircut, 0.0, 1.0))
     p_cons_no = float(np.clip(1.0 - p_blend_yes - uncertainty_haircut, 0.0, 1.0))
 
-    yes_edge = p_cons_yes - yes_price
     no_price = 1.0 - yes_price
+    yes_edge = p_cons_yes - yes_price
     no_edge = p_cons_no - no_price
 
     if yes_edge >= no_edge:
@@ -465,32 +513,56 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         chosen_prob = p_cons_yes
         chosen_price = yes_price
         chosen_edge = yes_edge
-        margin_c = final_mean - line_c
     else:
         side = "NO"
         chosen_prob = p_cons_no
         chosen_price = no_price
         chosen_edge = no_edge
-        margin_c = line_c - final_mean
 
-    margin_sigma = margin_c / sigma
+    center_distance_c = abs(final_mean - target_temp_c)
+    distance_sigma = center_distance_c / sigma
 
-    prob_score = scale_0_100(chosen_prob, 0.52, 0.90)
-    edge_score = scale_0_100(chosen_edge, 0.00, 0.12)
-    margin_score = scale_0_100(margin_sigma, 0.10, 1.35)
+    buckets = build_exact_buckets_from_distribution(
+        simulated=simulated,
+        half_width=half_width_c,
+        min_center=target_temp_c - max(6 * half_width_c, 6),
+        max_center=target_temp_c + max(6 * half_width_c, 6),
+    )
+
+    # Ranking da temperatura alvo dentro dos buckets simulados.
+    same_temp = buckets[np.isclose(buckets["Temperatura"].astype(float), target_temp_c, atol=max(0.001, half_width_c / 10))]
+    target_rank = int(same_temp.iloc[0]["Ranking"]) if not same_temp.empty else None
+
+    top_bucket_prob = float(buckets.iloc[0]["Probabilidade"]) if not buckets.empty else 0.0
+    target_is_top = target_rank == 1
+    target_prob_ratio = p_mc_yes / top_bucket_prob if top_bucket_prob > 0 else 0.0
+
+    # Para temperatura exata, YES não precisa de 80% para ser bom; precisa de ser mal precificado.
+    if side == "YES":
+        prob_score = scale_0_100(chosen_prob, 0.06, 0.28)
+        edge_score = scale_0_100(chosen_edge, 0.00, 0.10)
+        rank_score = 100 if target_rank == 1 else 80 if target_rank == 2 else 60 if target_rank == 3 else 35 if target_rank and target_rank <= 5 else 10
+        distance_score = 100 - scale_0_100(distance_sigma, 0.00, 1.75)
+    else:
+        prob_score = scale_0_100(chosen_prob, 0.70, 0.95)
+        edge_score = scale_0_100(chosen_edge, 0.00, 0.10)
+        rank_score = 100 if target_rank and target_rank >= 4 else 70 if target_rank == 3 else 45 if target_rank == 2 else 20
+        distance_score = scale_0_100(distance_sigma, 0.15, 1.50)
+
     consensus_score = 100 - scale_0_100(model_spread, 0.60, 3.00)
     horizon_score = 100 - scale_0_100(horizon, 2, 16)
     data_score = scale_0_100(n_models, 3, 7)
     resolution_score = 100 - 10 * resolution_risk
 
     technical_score = (
-        0.24 * prob_score
-        + 0.24 * edge_score
-        + 0.17 * margin_score
-        + 0.14 * consensus_score
-        + 0.09 * horizon_score
-        + 0.07 * data_score
-        + 0.05 * resolution_score
+        0.24 * edge_score
+        + 0.18 * prob_score
+        + 0.16 * rank_score
+        + 0.13 * distance_score
+        + 0.12 * consensus_score
+        + 0.07 * horizon_score
+        + 0.06 * data_score
+        + 0.04 * resolution_score
     )
     technical_score = float(np.clip(technical_score, 0, 100))
 
@@ -499,47 +571,61 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         hard_red_reasons.append("poucos modelos disponíveis")
     if chosen_edge <= 0.015:
         hard_red_reasons.append("edge insuficiente")
-    if chosen_prob < 0.58:
-        hard_red_reasons.append("probabilidade conservadora baixa")
-    if abs(margin_sigma) < 0.25:
-        hard_red_reasons.append("linha demasiado perto da estimativa")
+    if side == "YES" and target_rank is not None and target_rank > 4:
+        hard_red_reasons.append("temperatura alvo longe dos buckets mais prováveis")
+    if side == "YES" and p_cons_yes < max(0.035, yes_price * 0.85):
+        hard_red_reasons.append("probabilidade do YES demasiado baixa para o preço")
+    if side == "NO" and p_cons_no < 0.72:
+        hard_red_reasons.append("NO sem probabilidade conservadora suficiente")
 
+    # Regras do semáforo para mercado de temperatura específica.
     if hard_red_reasons:
         light = "VERMELHO"
-    elif (
-        chosen_prob >= 0.82
-        and chosen_edge >= 0.07
-        and margin_sigma >= 0.75
-        and model_spread <= 1.70
-        and sigma <= 3.90
-        and n_models >= 5
-        and technical_score >= 74
+    elif side == "YES" and (
+        chosen_edge >= 0.055
+        and p_cons_yes >= 0.075
+        and target_rank is not None
+        and target_rank <= 3
+        and target_prob_ratio >= 0.70
+        and model_spread <= 1.80
+        and technical_score >= 70
         and resolution_risk <= 5
     ):
         light = "VERDE"
-    elif chosen_prob >= 0.64 and chosen_edge >= 0.03 and margin_sigma >= 0.35 and technical_score >= 52:
+    elif side == "NO" and (
+        chosen_edge >= 0.045
+        and p_cons_no >= 0.84
+        and technical_score >= 68
+        and resolution_risk <= 6
+    ):
+        light = "VERDE"
+    elif chosen_edge >= 0.025 and technical_score >= 48:
         light = "AMARELO"
     else:
         light = "VERMELHO"
 
-    if light == "VERDE":
-        advice = "Setup favorável: apostar só faz sentido no lado indicado e com gestão de banca."
+    if light == "VERDE" and side == "YES":
+        advice = "A temperatura específica parece subvalorizada pelo mercado. Ainda assim, isto é uma aposta de bucket exato, nunca de risco baixo absoluto."
+    elif light == "VERDE" and side == "NO":
+        advice = "O mercado parece pagar demasiado pelo YES; matematicamente o lado favorecido é NO."
     elif light == "AMARELO":
-        advice = "Zona intermédia: só consideraria se o preço melhorar, com stake pequena, ou esperaria nova atualização dos modelos."
+        advice = "Existe algum edge, mas a robustez não chega para sinal verde. Esperaria melhor preço ou nova atualização dos modelos."
     else:
-        advice = "Não aconselho apostar: a margem estatística não compensa o risco estimado."
+        advice = "Não aconselho apostar: para temperatura específica, a margem estatística não compensa o risco estimado."
 
     normal_dist = NormalDist(mu=final_mean, sigma=sigma)
 
     stress_rows = []
     for shock in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]:
-        p_yes_shock = probability_from_normal(final_mean + shock, sigma, line_c)
+        p_yes_shock = interval_probability_normal(final_mean + shock, sigma, lower, upper)
         p_side = p_yes_shock if side == "YES" else 1.0 - p_yes_shock
+        price = yes_price if side == "YES" else no_price
         stress_rows.append(
             {
                 "Cenário": f"Erro sistemático {shock:+.1f} °C",
+                "Prob. YES alvo": p_yes_shock,
                 "Prob. lado escolhido": p_side,
-                "Edge estimado": p_side - chosen_price,
+                "Edge estimado": p_side - price,
             }
         )
 
@@ -561,6 +647,8 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         "clim_mean": clim_mean,
         "clim_std": clim_std,
         "clim_percentile": clim_percentile,
+        "lower": lower,
+        "upper": upper,
         "p_normal_yes": p_normal_yes,
         "p_mc_yes": p_mc_yes,
         "p_blend_yes": p_blend_yes,
@@ -572,16 +660,20 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         "chosen_prob": chosen_prob,
         "chosen_price": chosen_price,
         "chosen_edge": chosen_edge,
-        "margin_c": margin_c,
-        "margin_sigma": margin_sigma,
+        "distance_c": center_distance_c,
+        "distance_sigma": distance_sigma,
+        "target_rank": target_rank,
+        "top_bucket_prob": top_bucket_prob,
+        "target_prob_ratio": target_prob_ratio,
         "technical_score": technical_score,
         "light": light,
         "advice": advice,
         "hard_red_reasons": hard_red_reasons,
         "scores": {
-            "Probabilidade": prob_score,
             "Edge": edge_score,
-            "Margem vs linha": margin_score,
+            "Probabilidade": prob_score,
+            "Ranking do alvo": rank_score,
+            "Distância ao centro": distance_score,
             "Consenso modelos": consensus_score,
             "Horizonte": horizon_score,
             "Quantidade de dados": data_score,
@@ -591,14 +683,18 @@ def analyse(forecasts, climatology, target_day, line_c, yes_price, risk_profile,
         "interval_90": (normal_dist.inv_cdf(0.05), normal_dist.inv_cdf(0.95)),
         "interval_95": (normal_dist.inv_cdf(0.025), normal_dist.inv_cdf(0.975)),
         "simulated": simulated,
+        "buckets": buckets,
         "stress": pd.DataFrame(stress_rows),
     }
 
 
-def build_leave_one_out(forecasts, base_result, line_c, yes_price):
+def build_leave_one_out(forecasts, base_result, target_temp_c, half_width_c, yes_price):
     rows = []
     if len(forecasts) < 4:
         return pd.DataFrame(rows)
+
+    lower = target_temp_c - half_width_c
+    upper = target_temp_c + half_width_c
 
     for idx in forecasts.index:
         reduced = forecasts.drop(index=idx).reset_index(drop=True)
@@ -608,14 +704,15 @@ def build_leave_one_out(forecasts, base_result, line_c, yes_price):
         med = weighted_median(vals, w)
         tm = trimmed_mean(vals)
         center = 0.55 * mean + 0.30 * med + 0.15 * tm
-        p_yes = probability_from_normal(center, base_result["sigma"], line_c)
+        p_yes = interval_probability_normal(center, base_result["sigma"], lower, upper)
         side_prob = p_yes if base_result["side"] == "YES" else 1.0 - p_yes
         price = yes_price if base_result["side"] == "YES" else 1.0 - yes_price
         rows.append(
             {
                 "Sem o modelo": forecasts.loc[idx, "modelo"],
-                "Tmax centro": center,
+                "Centro": center,
                 "Dispersão": spread,
+                "Prob. YES alvo": p_yes,
                 "Prob. lado escolhido": side_prob,
                 "Edge": side_prob - price,
             }
@@ -628,7 +725,7 @@ def build_leave_one_out(forecasts, base_result, line_c, yes_price):
 # CHARTS
 # ============================================================
 
-def source_chart(forecasts, final_mean, line_c):
+def source_chart(forecasts, final_mean, target_temp_c, lower, upper):
     df = forecasts.sort_values("tmax")
     fig = px.bar(
         df,
@@ -639,25 +736,22 @@ def source_chart(forecasts, final_mean, line_c):
         labels={"tmax": "Tmax prevista", "modelo": "Modelo"},
     )
     fig.add_vline(x=final_mean, line_dash="dash", annotation_text="estimativa final")
-    fig.add_vline(x=line_c, line_dash="dot", annotation_text="linha mercado")
+    fig.add_vrect(x0=lower, x1=upper, opacity=0.18, line_width=0, annotation_text=f"alvo {target_temp_c:g}°C")
     fig.update_layout(height=max(380, 48 * len(df)), margin=dict(l=10, r=10, t=25, b=10), showlegend=False)
     return fig
 
 
-def probability_chart(mu, sigma, line_c, side):
+def probability_chart(mu, sigma, lower, upper, side):
     dist = NormalDist(mu=mu, sigma=sigma)
-    xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 350)
+    xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 450)
     ys = np.array([dist.pdf(float(x)) for x in xs])
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Distribuição"))
     fig.add_vline(x=mu, line_dash="dash", annotation_text="estimativa")
-    fig.add_vline(x=line_c, line_dash="dot", annotation_text="linha")
+    fig.add_vrect(x0=lower, x1=upper, opacity=0.22, line_width=0, annotation_text="bucket YES")
 
-    if side == "YES":
-        fill_x = xs[xs >= line_c]
-    else:
-        fill_x = xs[xs <= line_c]
+    fill_x = xs[(xs >= lower) & (xs < upper)]
     fill_y = np.array([dist.pdf(float(x)) for x in fill_x])
     fig.add_trace(
         go.Scatter(
@@ -665,7 +759,7 @@ def probability_chart(mu, sigma, line_c, side):
             y=fill_y,
             fill="tozeroy",
             mode="none",
-            name=f"Zona {side}",
+            name="Probabilidade YES",
         )
     )
 
@@ -688,14 +782,29 @@ def score_chart(scores):
     return fig
 
 
-def simulation_chart(simulated, line_c, final_mean):
+def simulation_chart(simulated, lower, upper, final_mean):
     fig = px.histogram(
         x=simulated,
-        nbins=60,
+        nbins=70,
         labels={"x": "Tmax simulada (°C)", "y": "Frequência"},
     )
     fig.add_vline(x=final_mean, line_dash="dash", annotation_text="estimativa")
-    fig.add_vline(x=line_c, line_dash="dot", annotation_text="linha")
+    fig.add_vrect(x0=lower, x1=upper, opacity=0.22, line_width=0, annotation_text="bucket alvo")
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=25, b=10), showlegend=False)
+    return fig
+
+
+def bucket_chart(buckets, target_temp_c):
+    df = buckets.head(12).sort_values("Temperatura")
+    df["Probabilidade %"] = 100 * df["Probabilidade"]
+    fig = px.bar(
+        df,
+        x="Temperatura",
+        y="Probabilidade %",
+        text=df["Probabilidade %"].map(lambda x: f"{x:.1f}%"),
+        labels={"Temperatura": "Temperatura específica", "Probabilidade %": "Probabilidade"},
+    )
+    fig.add_vline(x=target_temp_c, line_dash="dot", annotation_text="alvo")
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=25, b=10), showlegend=False)
     return fig
 
@@ -721,10 +830,10 @@ def stress_chart(stress):
 st.markdown(
     """
     <div class="hero">
-        <h1>🌡️ Weather Edge Pro</h1>
+        <h1>🎯 Weather Exact Edge</h1>
         <div class="muted">
-            Semáforo estatístico para mercados de temperatura máxima: modelos meteorológicos, climatologia,
-            incerteza, stress tests e edge vs preço.
+            Semáforo para apostas de temperatura máxima específica — não é over/under.
+            Calcula a probabilidade de a Tmax cair no bucket exato definido pelas regras do mercado.
         </div>
     </div>
     """,
@@ -732,7 +841,7 @@ st.markdown(
 )
 
 with st.container(border=True):
-    top1, top2, top3, top4 = st.columns([1.7, 1.05, 1.05, 0.9])
+    top1, top2, top3, top4, top5 = st.columns([1.55, 1.0, 0.95, 0.95, 0.85])
 
     with top1:
         city = st.text_input("Cidade", value="Lisboa", placeholder="Ex.: Lisboa, Portugal")
@@ -746,21 +855,37 @@ with st.container(border=True):
         )
 
     with top3:
-        line_c = st.number_input(
-            "Linha: Tmax ≥ X °C",
+        target_temp_c = st.number_input(
+            "Temperatura alvo",
             value=25.0,
             step=0.5,
             format="%.1f",
+            help="Ex.: se o mercado é 'Tmax será 25°C', escreve 25.",
         )
 
     with top4:
+        half_width_c = st.number_input(
+            "Bucket ± °C",
+            min_value=0.01,
+            max_value=2.00,
+            value=0.50,
+            step=0.05,
+            format="%.2f",
+            help="Para temperatura inteira arredondada: usa 0.50. Para 1 decimal: usa 0.05.",
+        )
+
+    with top5:
         yes_price = st.number_input(
             "Preço YES",
             min_value=0.01,
             max_value=0.99,
-            value=0.50,
+            value=0.15,
             step=0.01,
         )
+
+    st.caption(
+        f"Interpretação atual: YES ganha se a Tmax ficar entre **{target_temp_c - half_width_c:.2f}°C** e **{target_temp_c + half_width_c:.2f}°C**."
+    )
 
     with st.expander("Opções avançadas", expanded=False):
         adv1, adv2, adv3 = st.columns([1.2, 1.0, 1.0])
@@ -786,15 +911,15 @@ with st.container(border=True):
                 "Risco de resolução/regras",
                 0,
                 10,
-                3,
-                help="Aumenta se o mercado usa uma estação específica, regra ambígua, hora estranha ou fonte difícil de replicar.",
+                4,
+                help="Aumenta se o mercado usa estação específica, fonte diferente, arredondamento ambíguo ou horário estranho.",
             )
             window_days = st.slider("Janela histórica ± dias", 5, 21, 10, 1)
 
-    calculate = st.button("Analisar mercado", type="primary", use_container_width=True)
+    calculate = st.button("Analisar temperatura específica", type="primary", use_container_width=True)
 
 if not calculate:
-    st.info("Preenche cidade, dia, linha e preço YES. Depois clica em **Analisar mercado**.")
+    st.info("Preenche cidade, dia, temperatura alvo, bucket e preço YES. Depois clica em **Analisar temperatura específica**.")
     st.stop()
 
 if not city.strip():
@@ -820,7 +945,7 @@ place_name = format_place(place)
 records = []
 errors = []
 
-with st.spinner("A comparar modelos meteorológicos oficiais/agregados..."):
+with st.spinner("A comparar modelos meteorológicos..."):
     for model_name in selected_model_names:
         code = MODELS[model_name]
         try:
@@ -846,11 +971,12 @@ with st.spinner("A carregar climatologia histórica da mesma época do ano..."):
         window_days=window_days,
     )
 
-result = analyse(
+result = analyse_exact_temperature(
     forecasts=forecasts,
     climatology=climatology,
     target_day=target_day,
-    line_c=line_c,
+    target_temp_c=target_temp_c,
+    half_width_c=half_width_c,
     yes_price=yes_price,
     risk_profile=risk_profile,
     resolution_risk=resolution_risk,
@@ -864,15 +990,18 @@ emoji = "🟢" if light == "VERDE" else "🟡" if light == "AMARELO" else "🔴"
 
 st.caption(f"Local usado: **{place_name}** · Coordenadas: {lat:.4f}, {lon:.4f}")
 
+rank_text = "sem ranking" if result["target_rank"] is None else f"#{result['target_rank']} bucket mais provável"
+
 st.markdown(
     f"""
     <div class="result-card" style="background:{bg}; border-color:{color}55;">
         <div class="result-title" style="color:{color};">{emoji} {light} — {side}</div>
         <div class="result-subtitle">{result['advice']}</div>
         <span class="small-pill">Score técnico: {result['technical_score']:.0f}/100</span>
+        <span class="small-pill">Prob. conservadora YES: {100 * result['p_cons_yes']:.1f}%</span>
         <span class="small-pill">Prob. conservadora {side}: {100 * result['chosen_prob']:.1f}%</span>
-        <span class="small-pill">Edge: {result['chosen_edge']:+.3f}</span>
-        <span class="small-pill">Margem: {result['margin_c']:+.1f} °C</span>
+        <span class="small-pill">Edge {side}: {result['chosen_edge']:+.3f}</span>
+        <span class="small-pill">Alvo: {rank_text}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -883,15 +1012,15 @@ if result["hard_red_reasons"]:
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Tmax estimada", f"{result['final_mean']:.1f} °C")
-m2.metric("Linha", f"{line_c:.1f} °C")
+m2.metric("Bucket YES", f"{result['lower']:.1f}–{result['upper']:.1f} °C")
 m3.metric("Prob. YES", f"{100 * result['p_cons_yes']:.1f}%")
-m4.metric("Prob. NO", f"{100 * result['p_cons_no']:.1f}%")
+m4.metric("Edge YES", f"{result['yes_edge']:+.3f}")
 m5.metric("Sigma", f"{result['sigma']:.2f} °C")
 
 st.divider()
 
-summary_tab, math_tab, charts_tab, stress_tab, models_tab, method_tab = st.tabs(
-    ["Resumo", "Matemática", "Gráficos", "Stress tests", "Modelos", "Metodologia"]
+summary_tab, math_tab, charts_tab, buckets_tab, stress_tab, models_tab, method_tab = st.tabs(
+    ["Resumo", "Matemática", "Gráficos", "Temperaturas prováveis", "Stress tests", "Modelos", "Metodologia"]
 )
 
 with summary_tab:
@@ -900,26 +1029,27 @@ with summary_tab:
     with left:
         st.markdown("### Decisão")
         if light == "VERDE":
-            st.success(
-                f"O lado estatisticamente favorecido é **{side}**. O semáforo ficou verde porque probabilidade, edge, consenso e margem passam os filtros."
-            )
+            st.success(f"O lado estatisticamente favorecido é **{side}**.")
         elif light == "AMARELO":
-            st.warning(
-                f"O lado matematicamente melhor é **{side}**, mas ainda não é setup limpo. Espera melhor preço ou nova previsão."
-            )
+            st.warning(f"O lado matematicamente melhor é **{side}**, mas ainda não é setup limpo.")
         else:
-            st.error(
-                "O semáforo está vermelho: não há vantagem suficientemente robusta para justificar aposta de baixo risco."
-            )
+            st.error("O semáforo está vermelho: não há vantagem suficientemente robusta.")
 
         st.markdown(
             f"""
+            - **Mercado analisado:** Tmax será **{target_temp_c:g}°C**
+            - **Bucket usado:** `{result['lower']:.2f}°C ≤ Tmax < {result['upper']:.2f}°C`
             - **Preço YES informado:** {yes_price:.3f}
             - **Preço justo conservador YES:** {result['p_cons_yes']:.3f}
             - **Preço justo conservador NO:** {result['p_cons_no']:.3f}
             - **Edge YES:** {result['yes_edge']:+.3f}
             - **Edge NO:** {result['no_edge']:+.3f}
+            - **Ranking do alvo:** {rank_text}
             """
+        )
+
+        st.info(
+            "Num mercado de temperatura específica, o YES normalmente tem probabilidade baixa. Por isso o mais importante não é ser provável em absoluto, mas estar barato face ao preço justo estimado."
         )
 
     with right:
@@ -944,13 +1074,16 @@ with math_tab:
     st.markdown(
         f"""
         <div class="formula-box">
-        <b>Estimativa final:</b><br>
-        centro = 55% média ponderada + 30% mediana ponderada + 15% média aparada<br>
-        previsão final = peso_previsão × centro + (1 - peso_previsão) × climatologia<br><br>
-        <b>Incerteza:</b><br>
-        sigma = sqrt(erro_base² + discordância_modelos² + erro_sazonal² + penalização_amostra²) × multiplicador_risco<br><br>
-        <b>Probabilidade:</b><br>
-        P(YES) = P(Tmax ≥ linha). O semáforo usa uma mistura Normal + Monte Carlo com desconto conservador.
+        <b>Diferença fundamental:</b><br>
+        Este mercado não é P(Tmax ≥ X). É P(a ≤ Tmax < b).<br><br>
+        <b>Bucket analisado:</b><br>
+        a = temperatura_alvo − bucket = {result['lower']:.2f} °C<br>
+        b = temperatura_alvo + bucket = {result['upper']:.2f} °C<br><br>
+        <b>Probabilidade YES:</b><br>
+        P(YES) = P({result['lower']:.2f} ≤ Tmax < {result['upper']:.2f})<br><br>
+        <b>Probabilidade usada no semáforo:</b><br>
+        mistura de distribuição Normal + Monte Carlo, depois com desconto conservador por horizonte, dispersão,
+        poucos modelos e risco de resolução.
         </div>
         """,
         unsafe_allow_html=True,
@@ -961,16 +1094,10 @@ with math_tab:
     c2.metric("P(YES) Monte Carlo", f"{100 * result['p_mc_yes']:.1f}%")
     c3.metric("P(YES) conservadora", f"{100 * result['p_cons_yes']:.1f}%")
 
-    st.markdown("### Intervalos")
-    st.write(
-        f"**80%:** {result['interval_80'][0]:.1f} °C a {result['interval_80'][1]:.1f} °C"
-    )
-    st.write(
-        f"**90%:** {result['interval_90'][0]:.1f} °C a {result['interval_90'][1]:.1f} °C"
-    )
-    st.write(
-        f"**95%:** {result['interval_95'][0]:.1f} °C a {result['interval_95'][1]:.1f} °C"
-    )
+    st.markdown("### Intervalos da Tmax contínua")
+    st.write(f"**80%:** {result['interval_80'][0]:.1f} °C a {result['interval_80'][1]:.1f} °C")
+    st.write(f"**90%:** {result['interval_90'][0]:.1f} °C a {result['interval_90'][1]:.1f} °C")
+    st.write(f"**95%:** {result['interval_95'][0]:.1f} °C a {result['interval_95'][1]:.1f} °C")
 
     if result["clim_mean"] is not None:
         st.markdown("### Climatologia")
@@ -984,39 +1111,56 @@ with math_tab:
 with charts_tab:
     col_a, col_b = st.columns([1.05, 1.0])
     with col_a:
-        st.markdown("### Modelos vs linha")
-        st.plotly_chart(source_chart(forecasts, result["final_mean"], line_c), use_container_width=True)
+        st.markdown("### Modelos vs bucket alvo")
+        st.plotly_chart(
+            source_chart(forecasts, result["final_mean"], target_temp_c, result["lower"], result["upper"]),
+            use_container_width=True,
+        )
     with col_b:
         st.markdown("### Distribuição estimada")
         st.plotly_chart(
-            probability_chart(result["final_mean"], result["sigma"], line_c, side),
+            probability_chart(result["final_mean"], result["sigma"], result["lower"], result["upper"], side),
             use_container_width=True,
         )
 
     st.markdown("### Simulação Monte Carlo")
-    st.plotly_chart(simulation_chart(result["simulated"], line_c, result["final_mean"]), use_container_width=True)
+    st.plotly_chart(simulation_chart(result["simulated"], result["lower"], result["upper"], result["final_mean"]), use_container_width=True)
+
+with buckets_tab:
+    st.markdown("### Temperaturas específicas mais prováveis")
+    st.write(
+        "Esta tabela estima a probabilidade de cada temperatura específica/bucket. Se o alvo não está entre os primeiros, o YES tende a ser frágil."
+    )
+
+    st.plotly_chart(bucket_chart(result["buckets"], target_temp_c), use_container_width=True)
+
+    bucket_table = result["buckets"].head(20).copy()
+    bucket_table["Probabilidade"] = (100 * bucket_table["Probabilidade"]).round(2).astype(str) + "%"
+    st.dataframe(bucket_table[["Ranking", "Temperatura", "Intervalo", "Probabilidade"]], hide_index=True, use_container_width=True)
 
 with stress_tab:
     st.markdown("### Stress tests")
     st.write(
-        "Aqui a app força erros sistemáticos na temperatura prevista. Se o edge desaparece com -0.5 °C ou +0.5 °C, o setup não é robusto."
+        "Aqui a app força erros sistemáticos na temperatura prevista. Para YES, é mau sinal se o edge desaparece com ±0.5°C."
     )
 
     stress_df = result["stress"].copy()
     display_stress = stress_df.copy()
+    display_stress["Prob. YES alvo"] = (100 * display_stress["Prob. YES alvo"]).round(1).astype(str) + "%"
     display_stress["Prob. lado escolhido"] = (100 * display_stress["Prob. lado escolhido"]).round(1).astype(str) + "%"
     display_stress["Edge estimado"] = display_stress["Edge estimado"].map(lambda x: f"{x:+.3f}")
 
     st.plotly_chart(stress_chart(stress_df), use_container_width=True)
     st.dataframe(display_stress, hide_index=True, use_container_width=True)
 
-    loo = build_leave_one_out(forecasts, result, line_c, yes_price)
+    loo = build_leave_one_out(forecasts, result, target_temp_c, half_width_c, yes_price)
     if not loo.empty:
         st.markdown("### Sensibilidade leave-one-out")
         st.write("Remove um modelo de cada vez para ver se uma única fonte está a dominar a conclusão.")
         loo_display = loo.copy()
-        loo_display["Tmax centro"] = loo_display["Tmax centro"].round(2)
+        loo_display["Centro"] = loo_display["Centro"].round(2)
         loo_display["Dispersão"] = loo_display["Dispersão"].round(2)
+        loo_display["Prob. YES alvo"] = (100 * loo_display["Prob. YES alvo"]).round(1).astype(str) + "%"
         loo_display["Prob. lado escolhido"] = (100 * loo_display["Prob. lado escolhido"]).round(1).astype(str) + "%"
         loo_display["Edge"] = loo_display["Edge"].map(lambda x: f"{x:+.3f}")
         st.dataframe(loo_display, hide_index=True, use_container_width=True)
@@ -1041,28 +1185,31 @@ with method_tab:
     st.markdown("### Como ler o semáforo")
     st.markdown(
         """
-        **🟢 Verde** — só aparece quando há probabilidade conservadora alta, edge relevante, modelos relativamente alinhados,
-        margem clara face à linha e risco de resolução baixo/moderado.
+        **🟢 Verde** — só aparece quando o preço parece errado o suficiente face à probabilidade conservadora,
+        com boa robustez, modelos relativamente alinhados e risco de resolução aceitável.
 
         **🟡 Amarelo** — existe algum edge, mas não é suficientemente robusto. Normalmente significa esperar melhor preço,
         reduzir stake ou aguardar nova atualização dos modelos.
 
-        **🔴 Vermelho** — não aconselha aposta. Pode ser por edge pequeno, linha demasiado próxima da previsão,
+        **🔴 Vermelho** — não aconselha aposta. Pode ser por edge pequeno, alvo longe das temperaturas mais prováveis,
         poucos modelos, muita dispersão ou risco de resolução.
         """
     )
 
-    st.markdown("### Regras práticas usadas")
+    st.markdown("### Regra crítica para temperatura específica")
     st.markdown(
         """
-        - O preço justo do **YES** é a probabilidade conservadora de `Tmax ≥ linha`.
-        - O preço justo do **NO** é a probabilidade conservadora de `Tmax < linha`.
-        - `edge = preço_justo - preço_de_mercado`.
-        - O modelo desconta a probabilidade quando há poucos modelos, data distante, dispersão elevada ou risco de resolução.
-        - O Monte Carlo adiciona ruído e caudas pesadas para evitar falsa precisão.
+        Uma temperatura exata tem probabilidade contínua zero. Por isso a app converte a temperatura alvo num **bucket**:
+
+        - se a regra arredonda ao grau inteiro, usa **bucket ±0.50°C**;
+        - se a regra arredonda a uma casa decimal, usa **bucket ±0.05°C**;
+        - se o mercado usa Fahrenheit, converte primeiro a previsão/regra para a unidade correta ou adapta a app.
+
+        O valor justo do YES é a probabilidade conservadora de a Tmax cair dentro desse bucket.
         """
     )
 
     st.warning(
-        "Isto não é garantia de lucro nem recomendação financeira personalizada. Meteorologia tem erro local, e mercados podem resolver por fonte/estação diferente da previsão usada."
+        "Isto não é garantia de lucro nem recomendação financeira personalizada. Confirma sempre fonte oficial, estação usada, arredondamento, horário, unidade e regra exata de resolução do mercado."
     )
+
