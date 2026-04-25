@@ -1603,3 +1603,4 @@ with method_tab:
         "Isto não é garantia de lucro nem recomendação financeira personalizada. Confirma sempre fonte oficial, estação usada, arredondamento, horário, unidade e regra exata de resolução do mercado."
     )
 
+
