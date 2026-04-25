@@ -1,18 +1,18 @@
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from statistics import NormalDist
-from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 
 # ============================================================
-# WEATHER EDGE — STREAMLIT APP
-# Sem sidebar. Sem API key. Open-Meteo apenas.
+# APP CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -22,251 +22,237 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
-OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search"
-OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
-USER_AGENT = "weather-edge-polymarket/2.0"
-
-# Modelos fortes/precisos. A app tenta cada um e ignora automaticamente
-# os que não estiverem disponíveis para a localização/data.
-PRECISE_MODELS = [
-    {
-        "name": "Open-Meteo Best Match",
-        "code": None,
-        "provider": "Open-Meteo multi-model",
-        "base_weight": 1.20,
-        "note": "Combina automaticamente os melhores modelos para o local.",
-    },
-    {
-        "name": "ECMWF IFS 0.25°",
-        "code": "ecmwf_ifs025",
-        "provider": "ECMWF",
-        "base_weight": 1.35,
-        "note": "Modelo global europeu, normalmente muito forte em médio prazo.",
-    },
-    {
-        "name": "ECMWF AIFS 0.25°",
-        "code": "ecmwf_aifs025_single",
-        "provider": "ECMWF AI",
-        "base_weight": 1.20,
-        "note": "Modelo AI do ECMWF; útil como visão independente.",
-    },
-    {
-        "name": "UK Met Office Seamless",
-        "code": "ukmo_seamless",
-        "provider": "UKMO",
-        "base_weight": 1.10,
-        "note": "Modelo global/regional do Met Office.",
-    },
-    {
-        "name": "DWD ICON Seamless",
-        "code": "icon_seamless",
-        "provider": "DWD",
-        "base_weight": 1.08,
-        "note": "Forte na Europa; global/regional seamless.",
-    },
-    {
-        "name": "Météo-France Seamless",
-        "code": "meteofrance_seamless",
-        "provider": "Météo-France",
-        "base_weight": 1.08,
-        "note": "Muito útil para Europa ocidental e curto prazo.",
-    },
-    {
-        "name": "NOAA GFS Seamless",
-        "code": "gfs_seamless",
-        "provider": "NOAA/NCEP",
-        "base_weight": 1.00,
-        "note": "Global, bom para comparação e divergência.",
-    },
-]
-
-MODEL_LABELS = [m["name"] for m in PRECISE_MODELS]
-
-BET_EXACT = "Temperatura máxima exata"
-BET_OVER = "Temperatura máxima maior do que"
-
-UNIT_OPTIONS = {
-    "Celsius °C": {"api": "celsius", "symbol": "°C", "factor_from_c": 1.0},
-    "Fahrenheit °F": {"api": "fahrenheit", "symbol": "°F", "factor_from_c": 1.8},
-}
-
-DECISION_GREEN = "🟢 VERDE"
-DECISION_YELLOW = "🟡 AMARELO"
-DECISION_RED = "🔴 VERMELHO"
-
-
-# ============================================================
-# CSS / UI
-# ============================================================
-
 st.markdown(
     """
     <style>
     [data-testid="stSidebar"] {display: none;}
-    .block-container {
-        padding-top: 1.8rem;
-        padding-bottom: 3rem;
+    [data-testid="collapsedControl"] {display: none;}
+
+    .main .block-container {
+        padding-top: 2rem;
         max-width: 1180px;
     }
+
     .hero {
-        padding: 1.35rem 1.45rem;
-        border-radius: 1.25rem;
-        background: linear-gradient(135deg, rgba(255,255,255,0.08), rgba(127,127,127,0.06));
-        border: 1px solid rgba(127,127,127,0.18);
-        margin-bottom: 1.1rem;
+        padding: 1.35rem 1.5rem;
+        border: 1px solid rgba(120,120,120,.22);
+        border-radius: 24px;
+        background: linear-gradient(135deg, rgba(255,255,255,.06), rgba(120,120,120,.06));
+        margin-bottom: 1rem;
     }
-    .hero h1 {
-        margin-bottom: 0.25rem;
-        font-size: 2.15rem;
-        line-height: 1.15;
+
+    .small-muted {
+        color: #777;
+        font-size: .92rem;
     }
-    .subtle {
-        color: #888;
-        font-size: 0.96rem;
+
+    .signal-card {
+        padding: 1.15rem 1.25rem;
+        border-radius: 22px;
+        border: 1px solid rgba(120,120,120,.22);
+        margin: .5rem 0 1rem 0;
     }
-    .card {
-        border: 1px solid rgba(127,127,127,0.18);
-        border-radius: 1rem;
-        padding: 1rem;
-        background: rgba(127,127,127,0.045);
+
+    .green {
+        background: rgba(20, 150, 80, .13);
+        border-color: rgba(20, 150, 80, .35);
     }
-    .decision-green {
-        border-radius: 1.2rem;
-        padding: 1.2rem;
-        border: 1px solid rgba(0, 180, 90, 0.35);
-        background: rgba(0, 180, 90, 0.10);
+
+    .yellow {
+        background: rgba(230, 170, 25, .15);
+        border-color: rgba(230, 170, 25, .38);
     }
-    .decision-yellow {
-        border-radius: 1.2rem;
-        padding: 1.2rem;
-        border: 1px solid rgba(220, 170, 0, 0.35);
-        background: rgba(220, 170, 0, 0.10);
+
+    .red {
+        background: rgba(210, 60, 70, .13);
+        border-color: rgba(210, 60, 70, .35);
     }
-    .decision-red {
-        border-radius: 1.2rem;
-        padding: 1.2rem;
-        border: 1px solid rgba(220, 60, 60, 0.35);
-        background: rgba(220, 60, 60, 0.10);
+
+    .big-signal {
+        font-size: 2.1rem;
+        font-weight: 800;
+        line-height: 1.1;
+        margin-bottom: .2rem;
     }
-    div[data-testid="stMetric"] {
-        border: 1px solid rgba(127,127,127,0.16);
-        border-radius: 1rem;
-        padding: 0.85rem;
-        background: rgba(127,127,127,0.035);
+
+    .metric-card {
+        border: 1px solid rgba(120,120,120,.18);
+        border-radius: 18px;
+        padding: 1rem 1rem;
+        background: rgba(120,120,120,.05);
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-    <div class="hero">
-        <h1>🌡️ Weather Edge</h1>
-        <div class="subtle">
-            Análise probabilística da temperatura máxima para mercados tipo Polymarket:
-            temperatura exata ou maior do que uma linha. Interface limpa, sem sidebar.
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+APP_USER_AGENT = "weather-edge-streamlit/2.0"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# Só modelos fortes / institucionais. A app tenta cada um isoladamente;
+# se algum não estiver disponível para a cidade/data, é ignorado com aviso.
+PRECISE_MODELS = {
+    "ECMWF IFS 0.25°": {
+        "code": "ecmwf_ifs025",
+        "weight": 1.35,
+        "tier": "elite",
+    },
+    "ECMWF AIFS 0.25°": {
+        "code": "ecmwf_aifs025_single",
+        "weight": 1.20,
+        "tier": "elite",
+    },
+    "DWD ICON Seamless": {
+        "code": "icon_seamless",
+        "weight": 1.10,
+        "tier": "strong",
+    },
+    "Météo‑France Seamless": {
+        "code": "meteofrance_seamless",
+        "weight": 1.10,
+        "tier": "strong",
+    },
+    "UK Met Office Seamless": {
+        "code": "ukmo_seamless",
+        "weight": 1.08,
+        "tier": "strong",
+    },
+    "Open‑Meteo Best Match": {
+        "code": "best_match",
+        "weight": 1.05,
+        "tier": "blend",
+    },
+    # GFS fica como fallback útil para cobertura global, mas com menor peso.
+    "NOAA GFS Seamless": {
+        "code": "gfs_seamless",
+        "weight": 0.88,
+        "tier": "fallback",
+    },
+}
+
+DEFAULT_MODELS = [
+    "ECMWF IFS 0.25°",
+    "ECMWF AIFS 0.25°",
+    "DWD ICON Seamless",
+    "Météo‑France Seamless",
+    "UK Met Office Seamless",
+    "Open‑Meteo Best Match",
+]
+
+RISK_PROFILES = {
+    "Normal": 1.00,
+    "Conservador": 1.20,
+    "Muito conservador": 1.45,
+}
 
 
 # ============================================================
-# API HELPERS
+# DATA FUNCTIONS
 # ============================================================
 
-def http_get_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> dict:
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:350]}")
-    return r.json()
+def today_local() -> date:
+    return date.today()
 
 
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def geocode_city(city: str) -> List[dict]:
-    data = http_get_json(
-        OPEN_METEO_GEOCODING,
-        params={"name": city, "count": 8, "language": "pt", "format": "json"},
-    )
-    return data.get("results", []) or []
-
-
-def place_label(place: dict) -> str:
-    bits = [place.get("name"), place.get("admin1"), place.get("country")]
-    label = ", ".join([str(x) for x in bits if x])
-    return f"{label} · {place.get('latitude'):.4f}, {place.get('longitude'):.4f}"
-
-
-def safe_float(x: Any) -> Optional[float]:
+def safe_float(value):
     try:
-        if x is None:
+        if value is None:
             return None
-        value = float(x)
-        if math.isnan(value) or math.isinf(value):
+        value = float(value)
+        if math.isnan(value):
             return None
         return value
     except Exception:
         return None
 
 
-@st.cache_data(ttl=18 * 60, show_spinner=False)
-def fetch_model_forecast(
-    lat: float,
-    lon: float,
-    target_day: str,
-    unit_api: str,
-    model_name: str,
-    model_code: Optional[str],
-    provider: str,
-    base_weight: float,
-    note: str,
-) -> dict:
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def get_json(url: str, params: dict | None = None, timeout: int = 25) -> dict:
+    response = requests.get(
+        url,
+        params=params,
+        headers={"User-Agent": APP_USER_AGENT},
+        timeout=timeout,
+    )
+    if response.status_code != 200:
+        body = response.text[:450] if response.text else ""
+        raise RuntimeError(f"HTTP {response.status_code}: {body}")
+    return response.json()
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def geocode_city(city: str) -> list[dict]:
+    data = get_json(
+        OPEN_METEO_GEOCODING_URL,
+        params={"name": city, "count": 8, "language": "pt", "format": "json"},
+    )
+    return data.get("results", []) or []
+
+
+def format_place(item: dict) -> str:
+    parts = [item.get("name"), item.get("admin1"), item.get("country")]
+    text = ", ".join(str(x) for x in parts if x)
+    lat = item.get("latitude")
+    lon = item.get("longitude")
+    return f"{text}  ·  {lat:.4f}, {lon:.4f}"
+
+
+def parse_open_meteo_tmax(data: dict, target_day: date) -> float | None:
+    daily = data.get("daily", {})
+    times = daily.get("time", [])
+    target = target_day.isoformat()
+    if target not in times:
+        return None
+
+    idx = times.index(target)
+    keys = [key for key in daily.keys() if key.startswith("temperature_2m_max")]
+    for key in keys:
+        values = daily.get(key, [])
+        if isinstance(values, list) and idx < len(values):
+            value = safe_float(values[idx])
+            if value is not None:
+                return value
+    return None
+
+
+@st.cache_data(ttl=20 * 60, show_spinner=False)
+def fetch_model(lat: float, lon: float, target_day_str: str, model_name: str) -> dict:
+    target_day = date.fromisoformat(target_day_str)
+    meta = PRECISE_MODELS[model_name]
+    code = meta["code"]
+
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": target_day,
-        "end_date": target_day,
-        "daily": "temperature_2m_max,temperature_2m_min,apparent_temperature_max,precipitation_sum,wind_speed_10m_max",
+        "daily": "temperature_2m_max",
         "timezone": "auto",
-        "temperature_unit": unit_api,
+        "temperature_unit": "celsius",
+        "start_date": target_day_str,
+        "end_date": target_day_str,
         "cell_selection": "land",
     }
-    if model_code:
-        params["models"] = model_code
 
-    data = http_get_json(OPEN_METEO_FORECAST, params=params)
-    daily = data.get("daily", {})
-    times = daily.get("time", [])
+    if code != "best_match":
+        params["models"] = code
 
-    if target_day not in times:
-        raise RuntimeError("A data não veio na resposta do modelo.")
-
-    idx = times.index(target_day)
-
-    tmax = safe_float((daily.get("temperature_2m_max") or [None])[idx])
-    tmin = safe_float((daily.get("temperature_2m_min") or [None])[idx])
-    apparent = safe_float((daily.get("apparent_temperature_max") or [None])[idx])
-    rain = safe_float((daily.get("precipitation_sum") or [None])[idx])
-    wind = safe_float((daily.get("wind_speed_10m_max") or [None])[idx])
-
+    data = get_json(OPEN_METEO_FORECAST_URL, params=params)
+    tmax = parse_open_meteo_tmax(data, target_day)
     if tmax is None:
-        raise RuntimeError("Sem temperature_2m_max.")
+        raise RuntimeError("sem Tmax para esta data/local")
 
     return {
-        "modelo": model_name,
-        "codigo": model_code or "best_match",
-        "fornecedor": provider,
-        "tmax": tmax,
-        "tmin": tmin,
-        "sensacao_max": apparent,
-        "precipitacao": rain,
-        "vento_max": wind,
-        "peso_base": base_weight,
-        "nota": note,
+        "source": model_name,
+        "model_code": code,
+        "tier": meta["tier"],
+        "tmax_c": float(tmax),
+        "weight": float(meta["weight"]),
     }
 
 
@@ -279,36 +265,35 @@ def circular_doy_distance(a: int, b: int, days: int = 366) -> int:
 def fetch_climatology(
     lat: float,
     lon: float,
-    target_day: str,
-    unit_api: str,
+    target_day_str: str,
     years_back: int,
     window_days: int,
 ) -> pd.DataFrame:
-    target = date.fromisoformat(target_day)
-    end_year = min(date.today().year - 1, target.year - 1)
+    target_day = date.fromisoformat(target_day_str)
+    end_year = min(today_local().year - 1, target_day.year - 1)
     start_year = max(1940, end_year - years_back + 1)
 
     if end_year < start_year:
-        return pd.DataFrame(columns=["date", "tmax"])
+        return pd.DataFrame(columns=["date", "tmax_c"])
 
-    data = http_get_json(
-        OPEN_METEO_ARCHIVE,
+    data = get_json(
+        OPEN_METEO_ARCHIVE_URL,
         params={
             "latitude": lat,
             "longitude": lon,
             "start_date": f"{start_year}-01-01",
             "end_date": f"{end_year}-12-31",
             "daily": "temperature_2m_max",
-            "temperature_unit": unit_api,
+            "temperature_unit": "celsius",
             "timezone": "auto",
         },
         timeout=35,
     )
 
     daily = data.get("daily", {})
-    dates = daily.get("time", []) or []
-    temps = daily.get("temperature_2m_max", []) or []
-    target_doy = target.timetuple().tm_yday
+    dates = daily.get("time", [])
+    temps = daily.get("temperature_2m_max", [])
+    target_doy = target_day.timetuple().tm_yday
 
     rows = []
     for d_str, temp in zip(dates, temps):
@@ -317,754 +302,659 @@ def fetch_climatology(
             continue
         d = date.fromisoformat(d_str)
         if circular_doy_distance(d.timetuple().tm_yday, target_doy) <= window_days:
-            rows.append({"date": d, "tmax": value})
+            rows.append({"date": d, "tmax_c": value})
 
     return pd.DataFrame(rows)
 
 
 # ============================================================
-# MATHEMATICAL MODEL
+# MATH FUNCTIONS
 # ============================================================
 
 def weighted_mean(values: np.ndarray, weights: np.ndarray) -> float:
-    weights = np.asarray(weights, dtype=float)
-    values = np.asarray(values, dtype=float)
     weights = np.where(weights <= 0, 1.0, weights)
     return float(np.average(values, weights=weights))
 
 
-def weighted_std(values: np.ndarray, weights: np.ndarray) -> float:
+def weighted_std(values: np.ndarray, weights: np.ndarray, mean: float | None = None) -> float:
     if len(values) <= 1:
         return 0.0
-    mu = weighted_mean(values, weights)
-    var = float(np.average((values - mu) ** 2, weights=weights))
-    return math.sqrt(max(0.0, var))
+    weights = np.where(weights <= 0, 1.0, weights)
+    if mean is None:
+        mean = weighted_mean(values, weights)
+    var = float(np.average((values - mean) ** 2, weights=weights))
+    return math.sqrt(max(var, 0.0))
 
 
-def normal_cdf(x: float, mu: float, sigma: float) -> float:
-    return NormalDist(mu=mu, sigma=max(sigma, 1e-6)).cdf(x)
+def robust_location(values: np.ndarray, weights: np.ndarray) -> dict:
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+
+    w_mean = weighted_mean(values, weights)
+    median = float(np.median(values))
+
+    if len(values) >= 5:
+        ordered = np.sort(values)
+        trim_n = max(1, int(len(ordered) * 0.15))
+        trimmed = ordered[trim_n:-trim_n] if len(ordered[trim_n:-trim_n]) else ordered
+        trimmed_mean = float(np.mean(trimmed))
+    else:
+        trimmed_mean = w_mean
+
+    # Mistura robusta: ECMWF/modelos bons via média ponderada, mas com travão por mediana.
+    robust = 0.58 * w_mean + 0.27 * median + 0.15 * trimmed_mean
+
+    return {
+        "weighted_mean": w_mean,
+        "median": median,
+        "trimmed_mean": trimmed_mean,
+        "robust": robust,
+    }
 
 
-def normal_pdf(x: float, mu: float, sigma: float) -> float:
-    return NormalDist(mu=mu, sigma=max(sigma, 1e-6)).pdf(x)
+def leave_one_out_sensitivity(values: np.ndarray, weights: np.ndarray) -> float:
+    if len(values) <= 2:
+        return 0.0
+    base = weighted_mean(values, weights)
+    deviations = []
+    for i in range(len(values)):
+        mask = np.ones(len(values), dtype=bool)
+        mask[i] = False
+        loo = weighted_mean(values[mask], weights[mask])
+        deviations.append(abs(loo - base))
+    return float(max(deviations)) if deviations else 0.0
 
 
-def horizon_base_sigma(horizon_days: int, unit_factor: float, conservative: float) -> float:
-    # Piso deliberadamente conservador para Tmax diária.
-    # Em °C: ~0.85 no dia 0, ~1.5 dia 4, ~2.3 dia 8, ~3.2 dia 14.
+def forecast_error_floor(horizon_days: int, n_models: int) -> float:
+    # Piso conservador. Não é RMSE oficial; evita dar 99% de certeza só porque os modelos concordam.
     h = max(0, horizon_days)
-    sigma_c = 0.85 + 0.16 * h + 0.025 * (h ** 1.25)
-    return sigma_c * unit_factor * conservative
+    base = 0.90 + 0.16 * h
+    if h >= 5:
+        base += 0.20
+    if h >= 10:
+        base += 0.30
+    if n_models < 4:
+        base += 0.35
+    return base
 
 
-def make_mixture_distribution(
+def shrink_to_climatology(forecast_mean: float, clim_mean: float | None, horizon_days: int) -> tuple[float, float]:
+    if clim_mean is None or math.isnan(clim_mean):
+        return forecast_mean, 1.0
+
+    # Para 0-3 dias quase não mexe. Para 10-16 dias, puxa mais para o histórico.
+    forecast_weight = 1.0 / (1.0 + (max(0, horizon_days) / 15.0) ** 2)
+    posterior_mean = forecast_weight * forecast_mean + (1.0 - forecast_weight) * clim_mean
+    return float(posterior_mean), float(forecast_weight)
+
+
+def probability_for_market(dist: NormalDist, market_type: str, target_temp: float, exact_step: float) -> dict:
+    if market_type == "Temperatura exata":
+        half = exact_step / 2.0
+        low = target_temp - half
+        high = target_temp + half
+        p_yes = dist.cdf(high) - dist.cdf(low)
+        readable = f"Tmax entre {low:.2f} °C e {high:.2f} °C"
+        boundary = (low, high)
+    else:
+        p_yes = 1.0 - dist.cdf(target_temp)
+        readable = f"Tmax maior do que {target_temp:.2f} °C"
+        boundary = (target_temp, None)
+
+    return {
+        "p_yes": max(0.0, min(1.0, float(p_yes))),
+        "p_no": 1.0 - max(0.0, min(1.0, float(p_yes))),
+        "readable": readable,
+        "boundary": boundary,
+    }
+
+
+def score_signal(
+    p_yes: float,
+    market_price_yes: float,
+    sigma: float,
+    spread: float,
+    horizon_days: int,
+    n_models: int,
+    loo: float,
+    market_type: str,
+) -> dict:
+    edge = p_yes - market_price_yes
+    fair_price = p_yes
+
+    # Edge mínimo maior para temperatura exata, porque a resolução do mercado e estação oficial importam mais.
+    if market_type == "Temperatura exata":
+        green_edge = 0.10
+        yellow_edge = 0.04
+        max_sigma_green = 2.25
+    else:
+        green_edge = 0.07
+        yellow_edge = 0.03
+        max_sigma_green = 2.75
+
+    data_quality = 100.0
+    data_quality -= min(30, max(0, 4 - n_models) * 10)
+    data_quality -= min(22, spread * 8)
+    data_quality -= min(16, loo * 12)
+    data_quality -= min(18, max(0, horizon_days - 4) * 2.2)
+    data_quality -= min(18, max(0, sigma - 1.2) * 6)
+    data_quality = max(0.0, min(100.0, data_quality))
+
+    # Kelly teórico para contrato binário: b = payout odds netas.
+    # Para YES com preço c e payout 1, lucro líquido por unidade arriscada = (1-c)/c.
+    if 0 < market_price_yes < 1:
+        b = (1.0 - market_price_yes) / market_price_yes
+        kelly = (b * p_yes - (1 - p_yes)) / b
+        kelly = max(0.0, min(float(kelly), 0.25))
+    else:
+        kelly = 0.0
+
+    if (
+        edge >= green_edge
+        and data_quality >= 68
+        and sigma <= max_sigma_green
+        and spread <= 1.35
+        and loo <= 0.55
+        and n_models >= 4
+    ):
+        color = "green"
+        label = "🟢 VERDE"
+        decision = "Sinal estatístico favorável. Só faz sentido se as regras do mercado baterem certo com a fonte oficial de resolução."
+    elif edge >= yellow_edge and data_quality >= 52 and n_models >= 3:
+        color = "yellow"
+        label = "🟡 AMARELO"
+        decision = "Há algum edge, mas não é limpo. Reduz tamanho, espera melhor preço ou evita se a liquidez/spread for fraco."
+    else:
+        color = "red"
+        label = "🔴 VERMELHO"
+        decision = "Não há margem estatística suficiente para justificar a aposta com baixo risco."
+
+    return {
+        "edge": edge,
+        "fair_price": fair_price,
+        "data_quality": data_quality,
+        "kelly": kelly,
+        "color": color,
+        "label": label,
+        "decision": decision,
+    }
+
+
+def analyse(
     forecasts: pd.DataFrame,
     clim: pd.DataFrame,
     target_day: date,
-    unit_factor: float,
-    conservative: float,
-) -> Dict[str, Any]:
-    horizon = max(0, (target_day - date.today()).days)
+    market_type: str,
+    target_temp: float,
+    exact_step: float,
+    market_price_yes: float,
+    risk_profile: str,
+) -> dict:
+    values = forecasts["tmax_c"].to_numpy(dtype=float)
+    weights = forecasts["weight"].to_numpy(dtype=float)
 
-    df = forecasts.copy()
-    x = df["tmax"].to_numpy(dtype=float)
-    base_weights = df["peso_base"].to_numpy(dtype=float)
-
-    median = float(np.median(x))
-    mad = float(np.median(np.abs(x - median))) if len(x) else 0.0
-    robust_scale = max(1.0 * unit_factor, 1.4826 * mad)
-
-    # Penaliza outliers sem os remover.
-    outlier_distance = np.abs(x - median) / robust_scale
-    outlier_penalty = np.where(outlier_distance > 2.5, 0.45, 1.0)
-    weights = base_weights * outlier_penalty
-
-    model_spread = weighted_std(x, weights)
-    model_range = float(np.max(x) - np.min(x)) if len(x) else math.nan
-    model_mean = weighted_mean(x, weights)
-
-    base_sigma = horizon_base_sigma(horizon, unit_factor, conservative)
-
-    # Cada modelo vira um componente normal.
-    # Modelos penalizados recebem sigma maior.
-    component_sigmas = []
-    for penalty in outlier_penalty:
-        s = base_sigma * (1.25 if penalty < 1 else 1.0)
-        component_sigmas.append(max(0.45 * unit_factor, s))
-
-    components = []
-    for i, row in df.iterrows():
-        components.append(
-            {
-                "label": row["modelo"],
-                "mu": float(row["tmax"]),
-                "sigma": float(component_sigmas[i]),
-                "weight": float(weights[i]),
-                "type": "modelo",
-            }
-        )
+    loc = robust_location(values, weights)
+    spread = weighted_std(values, weights, loc["weighted_mean"])
+    loo = leave_one_out_sensitivity(values, weights)
+    horizon_days = max(0, (target_day - today_local()).days)
 
     clim_mean = None
     clim_std = None
-    prior_weight = 0.0
+    if not clim.empty:
+        clim_mean = float(clim["tmax_c"].mean())
+        clim_std = float(clim["tmax_c"].std(ddof=1)) if len(clim) > 1 else None
 
-    if not clim.empty and len(clim) >= 20:
-        clim_mean = float(clim["tmax"].mean())
-        clim_std = float(clim["tmax"].std(ddof=1))
-        if math.isnan(clim_std) or clim_std <= 0:
-            clim_std = 3.0 * unit_factor
+    posterior_mean, forecast_weight = shrink_to_climatology(loc["robust"], clim_mean, horizon_days)
 
-        # Quanto mais longe o horizonte, maior a força do prior histórico.
-        prior_weight = min(0.34, 0.05 + horizon / 55.0)
-        components.append(
-            {
-                "label": "Climatologia sazonal",
-                "mu": clim_mean,
-                "sigma": max(clim_std * 0.70, base_sigma * 1.15),
-                "weight": prior_weight * float(np.sum(weights)),
-                "type": "prior",
-            }
-        )
+    error_floor = forecast_error_floor(horizon_days, len(forecasts))
+    seasonal_floor = 0.0
+    if clim_std is not None and not math.isnan(clim_std):
+        seasonal_floor = min(1.15, 0.16 * clim_std)
 
-    raw_w = np.array([c["weight"] for c in components], dtype=float)
-    raw_w = np.where(raw_w <= 0, 1.0, raw_w)
-    norm_w = raw_w / raw_w.sum()
+    risk_multiplier = RISK_PROFILES.get(risk_profile, 1.20)
 
-    for c, w in zip(components, norm_w):
-        c["weight_norm"] = float(w)
+    # Combina incertezas aproximadamente independentes.
+    sigma = math.sqrt(
+        spread**2
+        + error_floor**2
+        + seasonal_floor**2
+        + min(1.0, loo * 1.15) ** 2
+    ) * risk_multiplier
+    sigma = max(0.70, float(sigma))
 
-    mus = np.array([c["mu"] for c in components], dtype=float)
-    sigmas = np.array([c["sigma"] for c in components], dtype=float)
+    dist = NormalDist(mu=posterior_mean, sigma=sigma)
+    market = probability_for_market(dist, market_type, target_temp, exact_step)
+    signal = score_signal(
+        p_yes=market["p_yes"],
+        market_price_yes=market_price_yes,
+        sigma=sigma,
+        spread=spread,
+        horizon_days=horizon_days,
+        n_models=len(forecasts),
+        loo=loo,
+        market_type=market_type,
+    )
 
-    mix_mean = float(np.sum(norm_w * mus))
-    mix_second = float(np.sum(norm_w * (sigmas**2 + mus**2)))
-    mix_var = max(0.0, mix_second - mix_mean**2)
-    mix_sigma = math.sqrt(mix_var)
-
-    # Score técnico: não é "probabilidade de estar certo"; é qualidade do sinal.
-    dispersion_penalty = min(28.0, 12.0 * (model_spread / max(unit_factor, 1e-6)))
-    range_penalty = min(22.0, 4.0 * (model_range / max(unit_factor, 1e-6)))
-    horizon_penalty = min(28.0, 2.0 * horizon)
-    n_penalty = 18.0 if len(df) < 3 else 8.0 if len(df) < 5 else 0.0
-    sigma_penalty = min(22.0, 5.0 * (mix_sigma / max(unit_factor, 1e-6)))
-
-    confidence = 100.0 - dispersion_penalty - range_penalty - horizon_penalty - n_penalty - sigma_penalty
-    confidence = float(max(0.0, min(100.0, confidence)))
-
-    if model_spread <= 0.75 * unit_factor and model_range <= 2.0 * unit_factor and len(df) >= 5:
-        consensus = "Forte"
-    elif model_spread <= 1.35 * unit_factor and model_range <= 3.5 * unit_factor and len(df) >= 4:
-        consensus = "Médio"
-    else:
-        consensus = "Fraco"
+    # Massa por bins para mercado de temperatura exata.
+    exact_grid = []
+    step = exact_step
+    center_min = math.floor((posterior_mean - 4 * sigma) / step) * step
+    center_max = math.ceil((posterior_mean + 4 * sigma) / step) * step
+    centers = np.arange(center_min, center_max + step, step)
+    for c in centers:
+        low = c - step / 2
+        high = c + step / 2
+        p = dist.cdf(high) - dist.cdf(low)
+        exact_grid.append({"temp_c": round(float(c), 3), "prob": float(max(0, p))})
+    exact_df = pd.DataFrame(exact_grid).sort_values("prob", ascending=False)
 
     return {
-        "components": components,
-        "mean": mix_mean,
-        "sigma": mix_sigma,
-        "model_mean": model_mean,
-        "model_spread": model_spread,
-        "model_range": model_range,
-        "horizon": horizon,
-        "base_sigma": base_sigma,
+        "locations": loc,
+        "posterior_mean": posterior_mean,
+        "forecast_weight": forecast_weight,
+        "spread": spread,
+        "loo": loo,
+        "horizon_days": horizon_days,
         "clim_mean": clim_mean,
         "clim_std": clim_std,
-        "prior_weight": prior_weight,
-        "confidence": confidence,
-        "consensus": consensus,
-        "outlier_penalty": outlier_penalty,
+        "error_floor": error_floor,
+        "seasonal_floor": seasonal_floor,
+        "sigma": sigma,
+        "dist": dist,
+        "market": market,
+        "signal": signal,
+        "ci80": (dist.inv_cdf(0.10), dist.inv_cdf(0.90)),
+        "ci90": (dist.inv_cdf(0.05), dist.inv_cdf(0.95)),
+        "ci95": (dist.inv_cdf(0.025), dist.inv_cdf(0.975)),
+        "exact_df": exact_df,
     }
-
-
-def mixture_probability_interval(components: List[dict], lower: float, upper: float) -> float:
-    total = 0.0
-    for c in components:
-        w = c["weight_norm"]
-        total += w * (normal_cdf(upper, c["mu"], c["sigma"]) - normal_cdf(lower, c["mu"], c["sigma"]))
-    return float(max(0.0, min(1.0, total)))
-
-
-def mixture_probability_over(components: List[dict], threshold: float) -> float:
-    total = 0.0
-    for c in components:
-        w = c["weight_norm"]
-        total += w * (1.0 - normal_cdf(threshold, c["mu"], c["sigma"]))
-    return float(max(0.0, min(1.0, total)))
-
-
-def mixture_quantile(components: List[dict], q: float, lo: float, hi: float) -> float:
-    for _ in range(80):
-        mid = (lo + hi) / 2
-        cdf = 0.0
-        for c in components:
-            cdf += c["weight_norm"] * normal_cdf(mid, c["mu"], c["sigma"])
-        if cdf < q:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2
-
-
-def expected_value(prob: float, price_yes: float) -> Dict[str, float]:
-    price_yes = max(0.001, min(0.999, price_yes))
-    price_no = 1.0 - price_yes
-
-    edge_yes = prob - price_yes
-    edge_no = (1.0 - prob) - price_no
-
-    roi_yes = edge_yes / price_yes
-    roi_no = edge_no / max(price_no, 0.001)
-
-    return {
-        "edge_yes": edge_yes,
-        "edge_no": edge_no,
-        "roi_yes": roi_yes,
-        "roi_no": roi_no,
-        "best_side": "YES" if edge_yes >= edge_no else "NO",
-        "best_edge": max(edge_yes, edge_no),
-        "best_roi": roi_yes if edge_yes >= edge_no else roi_no,
-    }
-
-
-def decide_signal(
-    prob: float,
-    ev: Dict[str, float],
-    confidence: float,
-    consensus: str,
-    sigma: float,
-    unit_factor: float,
-    bet_type: str,
-) -> Dict[str, str]:
-    best_edge = ev["best_edge"]
-    best_side = ev["best_side"]
-
-    risk_flags = []
-    if confidence < 55:
-        risk_flags.append("confiança técnica baixa")
-    if consensus == "Fraco":
-        risk_flags.append("modelos discordam")
-    if sigma > 3.0 * unit_factor:
-        risk_flags.append("distribuição muito larga")
-    if bet_type == BET_EXACT and prob < 0.18 and best_side == "YES":
-        risk_flags.append("temperatura exata é naturalmente difícil")
-
-    if best_edge >= 0.08 and confidence >= 68 and consensus != "Fraco" and sigma <= 3.2 * unit_factor:
-        color = DECISION_GREEN
-        css = "decision-green"
-        action = f"Sinal favorável para {best_side}"
-        explanation = "Há margem estatística clara contra o preço do mercado e a qualidade do sinal é aceitável."
-    elif best_edge >= 0.035 and confidence >= 50 and len(risk_flags) <= 1:
-        color = DECISION_YELLOW
-        css = "decision-yellow"
-        action = f"Sinal moderado para {best_side}, melhor esperar preço melhor ou reduzir tamanho"
-        explanation = "Existe edge, mas a incerteza ainda é relevante."
-    else:
-        color = DECISION_RED
-        css = "decision-red"
-        action = "Não apostar / sem edge suficiente"
-        explanation = "O preço não compensa a incerteza estimada ou os modelos não estão alinhados."
-
-    return {
-        "color": color,
-        "css": css,
-        "action": action,
-        "explanation": explanation,
-        "risk_flags": ", ".join(risk_flags) if risk_flags else "sem alertas fortes",
-    }
-
-
-def probability_text(p: float) -> str:
-    if p >= 0.80:
-        return "muito alta"
-    if p >= 0.65:
-        return "alta"
-    if p >= 0.52:
-        return "ligeiramente favorável"
-    if p >= 0.40:
-        return "incerta"
-    if p >= 0.20:
-        return "baixa"
-    return "muito baixa"
-
-
-def fmt_optional(value: Optional[float], symbol: str) -> str:
-    if value is None:
-        return "não disponível"
-    return f"{value:.1f}{symbol}"
 
 
 # ============================================================
 # CHARTS
 # ============================================================
 
-def chart_models(df: pd.DataFrame, target_value: float, final_mean: float, symbol: str, bet_type: str) -> go.Figure:
-    data = df.sort_values("tmax")
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=data["tmax"],
-            y=data["modelo"],
-            mode="markers",
-            marker=dict(size=14),
-            text=data["fornecedor"],
-            hovertemplate="<b>%{y}</b><br>%{text}<br>Tmax=%{x:.1f}" + symbol + "<extra></extra>",
-            name="Modelos",
-        )
+def source_chart(forecasts: pd.DataFrame, posterior_mean: float) -> go.Figure:
+    df = forecasts.sort_values("tmax_c")
+    fig = px.bar(
+        df,
+        x="tmax_c",
+        y="source",
+        orientation="h",
+        color="tier",
+        text=df["tmax_c"].map(lambda x: f"{x:.1f}°"),
+        labels={"tmax_c": "Tmax prevista (°C)", "source": "Modelo", "tier": "Classe"},
+        title="Previsões dos modelos selecionados",
     )
-    fig.add_vline(x=final_mean, line_dash="dash", annotation_text="estimativa final")
-    if bet_type == BET_OVER:
-        fig.add_vline(x=target_value, line_dash="dot", annotation_text="linha do mercado")
-    else:
-        fig.add_vrect(
-            x0=target_value - 0.5,
-            x1=target_value + 0.5,
-            opacity=0.12,
-            line_width=0,
-            annotation_text="zona exata",
-        )
-        fig.add_vline(x=target_value, line_dash="dot", annotation_text="alvo exato")
-    fig.update_layout(
-        title="Previsões dos modelos premium",
-        xaxis_title=f"Temperatura máxima ({symbol})",
-        yaxis_title="",
-        height=max(360, 55 * len(data)),
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
+    fig.add_vline(x=posterior_mean, line_dash="dash", annotation_text="estimativa final")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=max(390, 48 * len(df)), margin=dict(l=10, r=10, t=60, b=10))
     return fig
 
 
-def chart_distribution(components: List[dict], target_value: float, symbol: str, bet_type: str) -> go.Figure:
-    mus = np.array([c["mu"] for c in components], dtype=float)
-    sigmas = np.array([c["sigma"] for c in components], dtype=float)
-
-    lo = float(np.min(mus - 4 * sigmas))
-    hi = float(np.max(mus + 4 * sigmas))
-    xs = np.linspace(lo, hi, 600)
-
-    ys = []
-    for x in xs:
-        y = 0.0
-        for c in components:
-            y += c["weight_norm"] * normal_pdf(float(x), c["mu"], c["sigma"])
-        ys.append(y)
+def distribution_chart(analysis: dict, target_temp: float, market_type: str) -> go.Figure:
+    mu = analysis["posterior_mean"]
+    sigma = analysis["sigma"]
+    dist = analysis["dist"]
+    xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 380)
+    ys = [dist.pdf(float(x)) for x in xs]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Probabilidade estimada"))
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Distribuição estimada"))
+    fig.add_vline(x=mu, line_dash="dash", annotation_text="estimativa central")
 
-    if bet_type == BET_EXACT:
-        fig.add_vrect(
-            x0=target_value - 0.5,
-            x1=target_value + 0.5,
-            opacity=0.18,
-            line_width=0,
-            annotation_text=f"evento exato: {target_value:g}{symbol}",
-        )
+    if market_type == "Temperatura exata":
+        low, high = analysis["market"]["boundary"]
+        fig.add_vrect(x0=low, x1=high, opacity=0.18, line_width=0, annotation_text="zona YES")
     else:
-        fig.add_vrect(
-            x0=target_value,
-            x1=hi,
-            opacity=0.13,
-            line_width=0,
-            annotation_text=f"evento: > {target_value:g}{symbol}",
-        )
+        fig.add_vline(x=target_temp, line_dash="dot", annotation_text="linha do mercado")
 
-    fig.add_vline(x=target_value, line_dash="dot")
     fig.update_layout(
-        title="Distribuição probabilística final",
-        xaxis_title=f"Temperatura máxima ({symbol})",
+        title="Distribuição probabilística da Tmax",
+        xaxis_title="Temperatura máxima diária (°C)",
         yaxis_title="Densidade",
-        height=380,
+        height=390,
         margin=dict(l=10, r=10, t=60, b=10),
     )
     return fig
 
 
-def chart_climatology(clim: pd.DataFrame, final_mean: float, symbol: str) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Histogram(
-            x=clim["tmax"],
-            nbinsx=32,
-            name="Histórico",
-            opacity=0.75,
-        )
+def exact_probs_chart(exact_df: pd.DataFrame, target_temp: float) -> go.Figure:
+    top = exact_df.head(12).sort_values("temp_c")
+    fig = px.bar(
+        top,
+        x="temp_c",
+        y="prob",
+        text=top["prob"].map(lambda p: f"{100*p:.1f}%"),
+        labels={"temp_c": "Temperatura exata / bucket (°C)", "prob": "Probabilidade"},
+        title="Temperaturas exatas mais prováveis",
     )
-    fig.add_vline(x=final_mean, line_dash="dash", annotation_text="estimativa atual")
-    fig.update_layout(
-        title="Histórico da mesma época do ano",
-        xaxis_title=f"Tmax histórica ({symbol})",
-        yaxis_title="Frequência",
-        height=340,
-        margin=dict(l=10, r=10, t=60, b=10),
+    fig.add_vline(x=target_temp, line_dash="dot", annotation_text="alvo")
+    fig.update_traces(textposition="outside")
+    fig.update_layout(height=360, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=60, b=10))
+    return fig
+
+
+def climatology_chart(clim: pd.DataFrame, posterior_mean: float) -> go.Figure:
+    fig = px.histogram(
+        clim,
+        x="tmax_c",
+        nbins=34,
+        labels={"tmax_c": "Tmax histórica na mesma época do ano (°C)"},
+        title="Contexto histórico sazonal",
     )
+    fig.add_vline(x=posterior_mean, line_dash="dash", annotation_text="estimativa atual")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=60, b=10))
     return fig
 
 
 # ============================================================
-# INPUTS — SEM SIDEBAR
+# UI
 # ============================================================
-
-with st.container():
-    c1, c2, c3 = st.columns([1.4, 1, 1])
-    with c1:
-        city = st.text_input("Cidade", value="Lisboa", placeholder="Ex.: Lisboa, New York, Madrid")
-    with c2:
-        unit_label = st.selectbox("Unidade do mercado", list(UNIT_OPTIONS.keys()), index=0)
-    with c3:
-        max_date = date.today() + timedelta(days=15)
-        target_day = st.date_input(
-            "Data da aposta",
-            value=date.today() + timedelta(days=3),
-            min_value=date.today(),
-            max_value=max_date,
-        )
-
-unit = UNIT_OPTIONS[unit_label]
-unit_api = unit["api"]
-symbol = unit["symbol"]
-unit_factor = unit["factor_from_c"]
-
-matches: List[dict] = []
-selected_place = None
-
-if city.strip():
-    try:
-        matches = geocode_city(city.strip())
-    except Exception as e:
-        st.error(f"Erro ao procurar cidade: {e}")
-
-if matches:
-    selected_place = st.selectbox("Local encontrado", matches, format_func=place_label)
-else:
-    st.warning("Escreve uma cidade válida para procurar a localização.")
-
-st.markdown("### Tipo de mercado")
-b1, b2, b3 = st.columns([1.15, 1, 1])
-
-with b1:
-    bet_type = st.radio(
-        "Aposta",
-        [BET_EXACT, BET_OVER],
-        horizontal=False,
-        help="Exata = probabilidade da Tmax arredondar para esse valor. Maior do que = probabilidade de superar a linha.",
-    )
-
-with b2:
-    target_value = st.number_input(
-        f"Valor alvo ({symbol})",
-        value=25.0 if symbol == "°C" else 77.0,
-        step=1.0 if bet_type == BET_EXACT else 0.5,
-        format="%.1f",
-        help="Para temperatura exata, assume arredondamento ao inteiro mais próximo: alvo ± 0.5.",
-    )
-
-with b3:
-    market_price = st.number_input(
-        "Preço YES no mercado",
-        min_value=0.01,
-        max_value=0.99,
-        value=0.50,
-        step=0.01,
-        help="Ex.: preço 0.37 significa que o mercado implica ~37% antes de taxas/spread.",
-    )
-
-with st.expander("Configuração avançada", expanded=False):
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        years_back = st.slider("Anos de histórico", 8, 30, 20, 1)
-    with a2:
-        window_days = st.slider("Janela sazonal ± dias", 5, 25, 12, 1)
-    with a3:
-        conservative = st.slider("Conservadorismo da incerteza", 1.00, 1.80, 1.25, 0.05)
-
-    chosen_labels = st.multiselect(
-        "Modelos usados",
-        MODEL_LABELS,
-        default=MODEL_LABELS,
-        help="Estão pré-filtrados para modelos fortes. Se muitos falharem para uma região/data, a app continua com os restantes.",
-    )
-
-run = st.button("Analisar mercado", type="primary", use_container_width=True)
-
-if not run:
-    st.info("Preenche cidade, data, tipo de mercado e preço YES. Depois clica em **Analisar mercado**.")
-    st.stop()
-
-if selected_place is None:
-    st.error("Não foi possível escolher uma localização.")
-    st.stop()
-
-selected_models = [m for m in PRECISE_MODELS if m["name"] in chosen_labels]
-if not selected_models:
-    st.error("Seleciona pelo menos um modelo.")
-    st.stop()
-
-lat = float(selected_place["latitude"])
-lon = float(selected_place["longitude"])
-target_day_str = target_day.isoformat()
 
 st.markdown(
-    f"""
-    <div class="card">
-    <b>Local:</b> {place_label(selected_place)}<br>
-    <b>Evento:</b> {bet_type} · alvo <b>{target_value:g}{symbol}</b> · preço YES <b>{market_price:.2f}</b>
+    """
+    <div class="hero">
+        <h1 style="margin-bottom:.2rem">🌡️ Weather Edge</h1>
+        <div class="small-muted">
+            Análise probabilística da temperatura máxima diária para mercados tipo Polymarket.
+            Usa modelos meteorológicos institucionais, climatologia e incerteza conservadora.
+        </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+with st.container(border=True):
+    st.subheader("1) Mercado")
+    r1c1, r1c2, r1c3 = st.columns([1.3, 1, 1])
 
-# ============================================================
-# FETCH DATA
-# ============================================================
+    with r1c1:
+        city = st.text_input("Cidade", value="Lisboa, Portugal", placeholder="Ex.: Lisboa, Portugal")
 
-records = []
-errors = []
-
-progress = st.progress(0, text="A consultar modelos meteorológicos premium...")
-for i, model in enumerate(selected_models, start=1):
-    try:
-        rec = fetch_model_forecast(
-            lat=lat,
-            lon=lon,
-            target_day=target_day_str,
-            unit_api=unit_api,
-            model_name=model["name"],
-            model_code=model["code"],
-            provider=model["provider"],
-            base_weight=model["base_weight"],
-            note=model["note"],
+    with r1c2:
+        target_day = st.date_input(
+            "Data",
+            value=today_local() + timedelta(days=3),
+            min_value=today_local(),
+            max_value=today_local() + timedelta(days=16),
         )
-        records.append(rec)
-    except Exception as e:
-        errors.append(f"{model['name']}: {e}")
-    progress.progress(i / len(selected_models), text="A consultar modelos meteorológicos premium...")
 
-progress.empty()
+    with r1c3:
+        market_type = st.radio(
+            "Tipo",
+            ["Temperatura exata", "Maior do que"],
+            horizontal=True,
+            index=0,
+        )
 
-if len(records) < 2:
-    st.error("Poucos modelos responderam. Tenta outra data ou cidade. A análise precisa de pelo menos 2 fontes.")
-    with st.expander("Erros das fontes"):
-        for err in errors:
-            st.write(f"- {err}")
-    st.stop()
+    r2c1, r2c2, r2c3 = st.columns([1, 1, 1])
 
-forecasts = pd.DataFrame(records)
+    with r2c1:
+        target_temp = st.number_input(
+            "Temperatura-alvo / linha (°C)",
+            value=25.0,
+            step=0.5,
+            format="%.1f",
+        )
 
-with st.spinner("A calcular climatologia histórica..."):
-    try:
-        clim = fetch_climatology(lat, lon, target_day_str, unit_api, years_back, window_days)
-    except Exception as e:
-        clim = pd.DataFrame(columns=["date", "tmax"])
-        errors.append(f"Climatologia: {e}")
+    with r2c2:
+        market_price_yes = st.number_input(
+            "Preço YES no mercado",
+            min_value=0.01,
+            max_value=0.99,
+            value=0.20 if market_type == "Temperatura exata" else 0.50,
+            step=0.01,
+            format="%.2f",
+            help="Ex.: 0.32 significa que o mercado paga como se a probabilidade fosse 32% antes de fees/spread.",
+        )
 
-mix = make_mixture_distribution(forecasts, clim, target_day, unit_factor, conservative)
-components = mix["components"]
+    with r2c3:
+        exact_step = st.selectbox(
+            "Resolução para temperatura exata",
+            [1.0, 0.5, 0.1],
+            index=0,
+            format_func=lambda x: f"bucket de ±{x/2:g} °C",
+            disabled=(market_type != "Temperatura exata"),
+            help="Se o mercado resolve por graus inteiros, usa 1.0. Se resolve por décimos, usa 0.1.",
+        )
 
-if bet_type == BET_EXACT:
-    lower = float(target_value) - 0.5
-    upper = float(target_value) + 0.5
-    event_prob = mixture_probability_interval(components, lower, upper)
-    event_desc = f"Tmax arredondada = {target_value:g}{symbol}"
-else:
-    event_prob = mixture_probability_over(components, float(target_value))
-    event_desc = f"Tmax > {target_value:g}{symbol}"
+with st.expander("Configuração avançada", expanded=False):
+    a1, a2, a3 = st.columns([1.2, 1, 1])
 
-ev = expected_value(event_prob, market_price)
-decision = decide_signal(
-    prob=event_prob,
-    ev=ev,
-    confidence=mix["confidence"],
-    consensus=mix["consensus"],
-    sigma=mix["sigma"],
-    unit_factor=unit_factor,
-    bet_type=bet_type,
+    with a1:
+        selected_models = st.multiselect(
+            "Modelos usados",
+            options=list(PRECISE_MODELS.keys()),
+            default=DEFAULT_MODELS,
+        )
+
+    with a2:
+        risk_profile = st.selectbox(
+            "Perfil de incerteza",
+            options=list(RISK_PROFILES.keys()),
+            index=1,
+        )
+
+    with a3:
+        years_back = st.slider("Anos históricos", 8, 30, 18, 1)
+        window_days = st.slider("Janela sazonal ± dias", 4, 21, 10, 1)
+
+run = st.button("Analisar mercado", type="primary", use_container_width=True)
+
+st.caption(
+    "Nota: a app dá um sinal estatístico, não uma garantia de lucro. Confirma sempre a fonte de resolução oficial do mercado, fuso horário, spread e liquidez."
 )
 
-q05 = mixture_quantile(components, 0.05, mix["mean"] - 8 * mix["sigma"], mix["mean"] + 8 * mix["sigma"])
-q10 = mixture_quantile(components, 0.10, mix["mean"] - 8 * mix["sigma"], mix["mean"] + 8 * mix["sigma"])
-q50 = mixture_quantile(components, 0.50, mix["mean"] - 8 * mix["sigma"], mix["mean"] + 8 * mix["sigma"])
-q90 = mixture_quantile(components, 0.90, mix["mean"] - 8 * mix["sigma"], mix["mean"] + 8 * mix["sigma"])
-q95 = mixture_quantile(components, 0.95, mix["mean"] - 8 * mix["sigma"], mix["mean"] + 8 * mix["sigma"])
+if not run:
+    st.stop()
 
+if not city.strip():
+    st.error("Escreve uma cidade.")
+    st.stop()
+
+if len(selected_models) < 3:
+    st.error("Usa pelo menos 3 modelos para uma análise minimamente robusta.")
+    st.stop()
+
+# ============================================================
+# RUN PIPELINE
+# ============================================================
+
+try:
+    matches = geocode_city(city.strip())
+except Exception as exc:
+    st.error(f"Erro ao procurar cidade: {exc}")
+    st.stop()
+
+if not matches:
+    st.error("Não encontrei a cidade. Tenta incluir país/região, por exemplo: 'Porto, Portugal'.")
+    st.stop()
+
+if len(matches) == 1:
+    place = matches[0]
+else:
+    place = st.selectbox("Escolhe a localização correta", matches, format_func=format_place)
+
+lat = float(place["latitude"])
+lon = float(place["longitude"])
+timezone_name = place.get("timezone") or "UTC"
+
+warnings = []
+records = []
+
+with st.status("A calcular previsões e incerteza...", expanded=False) as status:
+    st.write("A consultar modelos meteorológicos...")
+    for model_name in selected_models:
+        try:
+            records.append(fetch_model(lat, lon, target_day.isoformat(), model_name))
+        except Exception as exc:
+            warnings.append(f"{model_name}: {exc}")
+
+    if len(records) < 3:
+        st.error("Poucos modelos devolveram dados. Tenta outra data/cidade ou ativa mais modelos.")
+        if warnings:
+            with st.expander("Avisos técnicos"):
+                for w in warnings:
+                    st.write(f"- {w}")
+        st.stop()
+
+    st.write("A obter climatologia histórica...")
+    try:
+        clim = fetch_climatology(lat, lon, target_day.isoformat(), years_back, window_days)
+    except Exception as exc:
+        clim = pd.DataFrame(columns=["date", "tmax_c"])
+        warnings.append(f"Climatologia: {exc}")
+
+    forecasts = pd.DataFrame(records)
+    analysis = analyse(
+        forecasts=forecasts,
+        clim=clim,
+        target_day=target_day,
+        market_type=market_type,
+        target_temp=float(target_temp),
+        exact_step=float(exact_step),
+        market_price_yes=float(market_price_yes),
+        risk_profile=risk_profile,
+    )
+    status.update(label="Análise concluída", state="complete")
 
 # ============================================================
 # OUTPUT
 # ============================================================
 
-st.markdown("## Decisão")
+st.markdown("---")
+st.subheader("2) Decisão")
+
+signal = analysis["signal"]
+market = analysis["market"]
 
 st.markdown(
     f"""
-    <div class="{decision['css']}">
-        <h2 style="margin-top:0">{decision['color']} · {decision['action']}</h2>
-        <p style="font-size:1.05rem">{decision['explanation']}</p>
-        <p><b>Evento analisado:</b> {event_desc}</p>
-        <p><b>Alertas:</b> {decision['risk_flags']}</p>
+    <div class="signal-card {signal['color']}">
+        <div class="big-signal">{signal['label']}</div>
+        <div style="font-size:1.08rem; margin-bottom:.35rem">{signal['decision']}</div>
+        <div class="small-muted">Mercado analisado: <b>{market['readable']}</b></div>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Probabilidade estimada", f"{100 * event_prob:.1f}%")
-m2.metric("Preço justo YES", f"{event_prob:.3f}", help="Probabilidade estimada convertida para preço justo binário.")
-m3.metric("Edge melhor lado", f"{ev['best_edge']:+.3f}", help="Diferença entre probabilidade estimada e preço de mercado.")
-m4.metric("Melhor lado", ev["best_side"])
+m1.metric("Probabilidade YES", f"{100 * market['p_yes']:.1f}%")
+m2.metric("Preço justo YES", f"{signal['fair_price']:.3f}")
+m3.metric("Edge vs mercado", f"{signal['edge']:+.3f}")
+m4.metric("Qualidade técnica", f"{signal['data_quality']:.0f}/100")
 
 m5, m6, m7, m8 = st.columns(4)
-m5.metric("Tmax central", f"{mix['mean']:.1f}{symbol}")
-m6.metric("Intervalo 80%", f"{q10:.1f}–{q90:.1f}{symbol}")
-m7.metric("Consenso modelos", mix["consensus"])
-m8.metric("Score técnico", f"{mix['confidence']:.0f}/100")
+m5.metric("Tmax central", f"{analysis['posterior_mean']:.1f} °C")
+m6.metric("Intervalo 90%", f"{analysis['ci90'][0]:.1f}–{analysis['ci90'][1]:.1f} °C")
+m7.metric("Incerteza σ", f"{analysis['sigma']:.2f} °C")
+m8.metric("Kelly teórico capado", f"{100 * signal['kelly']:.1f}%")
 
-st.markdown("### Interpretação")
-if ev["best_side"] == "YES":
-    st.write(
-        f"O mercado cobra **{market_price:.2f}** pelo YES. O modelo estima **{event_prob:.3f}**. "
-        f"Edge YES = **{ev['edge_yes']:+.3f}** e ROI teórico por unidade arriscada ≈ **{100 * ev['roi_yes']:+.1f}%**."
-    )
-else:
-    st.write(
-        f"O mercado cobra **{market_price:.2f}** pelo YES, logo o NO custa aproximadamente **{1-market_price:.2f}**. "
-        f"O modelo estima probabilidade de NO de **{1-event_prob:.3f}**. "
-        f"Edge NO = **{ev['edge_no']:+.3f}** e ROI teórico por unidade arriscada ≈ **{100 * ev['roi_no']:+.1f}%**."
+if signal["kelly"] > 0:
+    st.info(
+        "Kelly é apenas uma referência matemática para tamanho máximo teórico. Em mercados ilíquidos, usa uma fração muito menor ou zero."
     )
 
-st.write(
-    f"A probabilidade do evento é **{probability_text(event_prob)}**. "
-    f"A temperatura máxima central estimada é **{mix['mean']:.1f}{symbol}**, "
-    f"com intervalo de 90% aproximado entre **{q05:.1f}{symbol}** e **{q95:.1f}{symbol}**."
-)
+st.subheader("3) Análise matemática")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Gráficos", "Modelos", "Matemática", "Riscos"])
-
-with tab1:
-    st.plotly_chart(chart_models(forecasts, target_value, mix["mean"], symbol, bet_type), use_container_width=True)
-    st.plotly_chart(chart_distribution(components, target_value, symbol, bet_type), use_container_width=True)
-    if not clim.empty:
-        st.plotly_chart(chart_climatology(clim, mix["mean"], symbol), use_container_width=True)
-    else:
-        st.info("Sem climatologia histórica suficiente para este local.")
-
-with tab2:
-    table = forecasts.copy()
-    numeric_cols = ["tmax", "tmin", "sensacao_max", "precipitacao", "vento_max", "peso_base"]
-    for col in numeric_cols:
-        table[col] = pd.to_numeric(table[col], errors="coerce").round(2)
-
-    st.dataframe(
-        table[
-            [
-                "modelo",
-                "fornecedor",
-                "codigo",
-                "tmax",
-                "tmin",
-                "sensacao_max",
-                "precipitacao",
-                "vento_max",
-                "peso_base",
-                "nota",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    if errors:
-        with st.expander("Fontes ignoradas / erros"):
-            for err in errors:
-                st.write(f"- {err}")
-
-with tab3:
+math_c1, math_c2 = st.columns([1, 1])
+with math_c1:
     st.markdown(
         f"""
-        A análise usa uma **mistura de distribuições normais**, não apenas uma média simples.
+        **Modelo probabilístico usado**
 
-        **1. Cada modelo é um componente probabilístico**
-
-        Para cada modelo `i`:
-
-        `Tmax_i ~ Normal(mu_i, sigma_i)`
-
-        onde `mu_i` é a previsão do modelo e `sigma_i` aumenta com:
-        - distância temporal da data;
-        - conservadorismo escolhido;
-        - possível comportamento de outlier.
-
-        **2. Pesos**
-
-        Os pesos base favorecem modelos premium como ECMWF/Best Match,
-        mas previsões muito afastadas da mediana são penalizadas em vez de removidas.
-
-        **3. Climatologia como prior**
-
-        Se houver histórico suficiente, a app adiciona um componente de climatologia sazonal.
-        O peso deste prior cresce com o horizonte temporal. Nesta análise:
-        - peso do prior histórico: **{100 * mix['prior_weight']:.1f}%**
-        - média climática: **{fmt_optional(mix['clim_mean'], symbol)}**
-        - desvio climático: **{fmt_optional(mix['clim_std'], symbol)}**
-
-        **4. Temperatura exata**
-
-        Para aposta exata, a app calcula:
-
-        `P(alvo - 0.5 <= Tmax < alvo + 0.5)`
-
-        Isto corresponde a uma regra de arredondamento ao inteiro mais próximo.
-
-        **5. Maior do que**
-
-        Para aposta de linha, calcula:
-
-        `P(Tmax > linha)`
-
-        **6. Decisão verde/amarelo/vermelho**
-
-        A cor combina:
-        - edge contra o preço do mercado;
-        - dispersão entre modelos;
-        - largura da distribuição;
-        - número de modelos válidos;
-        - horizonte temporal;
-        - consenso dos modelos.
+        - Média ponderada dos modelos: **{analysis['locations']['weighted_mean']:.2f} °C**
+        - Mediana dos modelos: **{analysis['locations']['median']:.2f} °C**
+        - Média robusta/trimmed: **{analysis['locations']['trimmed_mean']:.2f} °C**
+        - Estimativa robusta antes da climatologia: **{analysis['locations']['robust']:.2f} °C**
+        - Peso dado à previsão vs climatologia: **{100 * analysis['forecast_weight']:.1f}%**
+        - Dispersão ponderada entre modelos: **{analysis['spread']:.2f} °C**
+        - Sensibilidade leave‑one‑out: **{analysis['loo']:.2f} °C**
+        - Piso de erro por horizonte: **{analysis['error_floor']:.2f} °C**
+        - Piso sazonal histórico: **{analysis['seasonal_floor']:.2f} °C**
         """
     )
 
-    detail = pd.DataFrame(
-        [
-            {"métrica": "Média ponderada dos modelos", "valor": f"{mix['model_mean']:.2f}{symbol}"},
-            {"métrica": "Dispersão ponderada entre modelos", "valor": f"{mix['model_spread']:.2f}{symbol}"},
-            {"métrica": "Amplitude máx-min modelos", "valor": f"{mix['model_range']:.2f}{symbol}"},
-            {"métrica": "Sigma base por horizonte", "valor": f"{mix['base_sigma']:.2f}{symbol}"},
-            {"métrica": "Sigma final da mistura", "valor": f"{mix['sigma']:.2f}{symbol}"},
-            {"métrica": "Horizonte", "valor": f"{mix['horizon']} dias"},
-            {"métrica": "Probabilidade YES", "valor": f"{event_prob:.4f}"},
-            {"métrica": "Probabilidade NO", "valor": f"{1-event_prob:.4f}"},
-            {"métrica": "Edge YES", "valor": f"{ev['edge_yes']:+.4f}"},
-            {"métrica": "Edge NO", "valor": f"{ev['edge_no']:+.4f}"},
-        ]
-    )
-    st.dataframe(detail, hide_index=True, use_container_width=True)
+with math_c2:
+    if analysis["clim_mean"] is not None:
+        st.markdown(
+            f"""
+            **Climatologia da mesma época**
 
-with tab4:
-    st.warning(
+            - Observações históricas usadas: **{len(clim)}**
+            - Média histórica sazonal: **{analysis['clim_mean']:.2f} °C**
+            - Desvio-padrão histórico sazonal: **{analysis['clim_std']:.2f} °C**
+            - Horizonte da aposta: **{analysis['horizon_days']} dias**
+            - Perfil de incerteza: **{risk_profile}**
+
+            A distribuição final é aproximada como normal, com média **{analysis['posterior_mean']:.2f} °C** e σ **{analysis['sigma']:.2f} °C**.
+            """
+        )
+    else:
+        st.markdown(
+            f"""
+            **Climatologia indisponível**
+
+            A análise usou apenas o ensemble de modelos e pisos conservadores de erro.
+
+            - Horizonte da aposta: **{analysis['horizon_days']} dias**
+            - Perfil de incerteza: **{risk_profile}**
+            - Distribuição final: média **{analysis['posterior_mean']:.2f} °C**, σ **{analysis['sigma']:.2f} °C**
+            """
+        )
+
+with st.expander("Interpretação do verde/amarelo/vermelho"):
+    st.markdown(
         """
-        Antes de apostar, verifica sempre:
-        1. qual é a estação meteorológica oficial usada na resolução;
-        2. se a temperatura é em °C ou °F;
-        3. se a regra é arredondamento, truncagem ou valor observado bruto;
-        4. hora local do dia de resolução;
-        5. liquidez, spread e possibilidade de mudança na fonte de resolução.
+        **Verde** exige edge positivo claro, boa qualidade técnica, vários modelos disponíveis, baixa dispersão e baixa sensibilidade a remover um modelo.
+
+        **Amarelo** significa que há algum edge, mas a margem pode desaparecer com spread, mudança de previsão, fonte oficial diferente ou baixa liquidez.
+
+        **Vermelho** significa que a app não encontrou edge suficiente para considerar a aposta de baixo risco.
+
+        Para mercados de **temperatura exata**, a app é mais exigente, porque pequenos erros de arredondamento, estação oficial e fuso horário podem mudar totalmente a resolução.
         """
-    )
-    st.write(
-        "Mesmo um sinal verde não significa risco zero. Temperaturas máximas locais podem falhar por microclima, "
-        "brisa marítima, altitude, nebulosidade, precipitação convectiva ou diferença entre grelha do modelo e estação oficial."
     )
 
-st.caption(
-    "Sem API key. Usa Open-Meteo para previsão, geocoding e histórico. Não executa trades; calcula sinal estatístico."
+st.subheader("4) Gráficos")
+
+g1, g2 = st.columns([1, 1])
+with g1:
+    st.plotly_chart(source_chart(forecasts, analysis["posterior_mean"]), use_container_width=True)
+with g2:
+    st.plotly_chart(distribution_chart(analysis, float(target_temp), market_type), use_container_width=True)
+
+if market_type == "Temperatura exata":
+    st.plotly_chart(exact_probs_chart(analysis["exact_df"], float(target_temp)), use_container_width=True)
+
+if not clim.empty:
+    st.plotly_chart(climatology_chart(clim, analysis["posterior_mean"]), use_container_width=True)
+
+st.subheader("5) Dados")
+
+show_df = forecasts.copy().sort_values("tmax_c", ascending=False)
+show_df["tmax_c"] = show_df["tmax_c"].round(2)
+show_df["weight"] = show_df["weight"].round(2)
+st.dataframe(
+    show_df[["source", "tier", "model_code", "tmax_c", "weight"]],
+    hide_index=True,
+    use_container_width=True,
 )
 
+if market_type == "Temperatura exata":
+    top_exact = analysis["exact_df"].head(8).copy()
+    top_exact["prob_%"] = (100 * top_exact["prob"]).round(2)
+    top_exact = top_exact[["temp_c", "prob_%"]]
+    st.markdown("**Top temperaturas exatas estimadas**")
+    st.dataframe(top_exact, hide_index=True, use_container_width=True)
+
+if warnings:
+    with st.expander("Avisos técnicos das fontes"):
+        for w in warnings:
+            st.warning(w)
+
+st.caption(
+    "Versão simples sem sidebar e sem secrets. Usa Open‑Meteo para previsões e histórico. Não faz trading automático nem substitui a validação das regras oficiais do mercado."
+)
