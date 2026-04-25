@@ -9,6 +9,11 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+try:
+    import airportsdata
+except Exception:
+    airportsdata = None
+
 
 # ============================================================
 # CONFIG
@@ -80,6 +85,25 @@ LIGHT_BG = {
 
 MARKET_EXACT = "Temperatura específica"
 MARKET_OVER = "Maior que / acima da linha"
+
+LOCATION_AIRPORT = "Aeroporto por IATA/ICAO"
+LOCATION_SEARCH = "Pesquisar cidade/local"
+LOCATION_MANUAL = "Coordenadas manuais"
+
+# Fallback pequeno para aeroportos muito usados, caso `airportsdata` não esteja instalado.
+# Para cobertura global completa, adiciona airportsdata ao requirements.txt.
+AIRPORT_FALLBACKS = {
+    "RKSI": {"iata": "ICN", "icao": "RKSI", "name": "Incheon International Airport", "city": "Seoul/Incheon", "country": "KR", "lat": 37.4691, "lon": 126.4505},
+    "ICN": {"iata": "ICN", "icao": "RKSI", "name": "Incheon International Airport", "city": "Seoul/Incheon", "country": "KR", "lat": 37.4691, "lon": 126.4505},
+    "RKSS": {"iata": "GMP", "icao": "RKSS", "name": "Gimpo International Airport", "city": "Seoul", "country": "KR", "lat": 37.5583, "lon": 126.7906},
+    "GMP": {"iata": "GMP", "icao": "RKSS", "name": "Gimpo International Airport", "city": "Seoul", "country": "KR", "lat": 37.5583, "lon": 126.7906},
+    "LPPT": {"iata": "LIS", "icao": "LPPT", "name": "Lisbon Airport", "city": "Lisbon", "country": "PT", "lat": 38.7742, "lon": -9.1342},
+    "LIS": {"iata": "LIS", "icao": "LPPT", "name": "Lisbon Airport", "city": "Lisbon", "country": "PT", "lat": 38.7742, "lon": -9.1342},
+    "EGLL": {"iata": "LHR", "icao": "EGLL", "name": "London Heathrow Airport", "city": "London", "country": "GB", "lat": 51.4700, "lon": -0.4543},
+    "LHR": {"iata": "LHR", "icao": "EGLL", "name": "London Heathrow Airport", "city": "London", "country": "GB", "lat": 51.4700, "lon": -0.4543},
+    "KJFK": {"iata": "JFK", "icao": "KJFK", "name": "John F. Kennedy International Airport", "city": "New York", "country": "US", "lat": 40.6413, "lon": -73.7781},
+    "JFK": {"iata": "JFK", "icao": "KJFK", "name": "John F. Kennedy International Airport", "city": "New York", "country": "US", "lat": 40.6413, "lon": -73.7781},
+}
 
 
 # ============================================================
@@ -196,6 +220,77 @@ def format_place_with_coords(place):
         elev_text = f" · {float(elevation):.0f} m"
 
     return f"{name}{coord_text}{elev_text}"
+
+
+def airport_display_name(airport):
+    code_bits = []
+    if airport.get("iata"):
+        code_bits.append(airport.get("iata"))
+    if airport.get("icao"):
+        code_bits.append(airport.get("icao"))
+    codes = "/".join(code_bits)
+
+    name = airport.get("name") or "Aeroporto"
+    city = airport.get("city") or ""
+    country = airport.get("country") or ""
+    lat = float(airport.get("lat"))
+    lon = float(airport.get("lon"))
+
+    place = ", ".join([x for x in [city, country] if x])
+    if place:
+        return f"{codes} · {name} · {place} · {lat:.4f}, {lon:.4f}"
+    return f"{codes} · {name} · {lat:.4f}, {lon:.4f}"
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def load_airport_db():
+    if airportsdata is None:
+        return {}, {}
+    try:
+        return airportsdata.load("IATA"), airportsdata.load("ICAO")
+    except Exception:
+        return {}, {}
+
+
+def normalize_airport_record(record, fallback_code=None):
+    if not record:
+        return None
+
+    # airportsdata usa chaves diferentes das nossas fallback.
+    iata = record.get("iata") or record.get("iata_code") or fallback_code if fallback_code and len(fallback_code) == 3 else record.get("iata") or record.get("iata_code")
+    icao = record.get("icao") or record.get("icao_code") or fallback_code if fallback_code and len(fallback_code) == 4 else record.get("icao") or record.get("icao_code")
+
+    lat = record.get("lat", record.get("latitude"))
+    lon = record.get("lon", record.get("longitude"))
+    if lat is None or lon is None:
+        return None
+
+    return {
+        "iata": iata,
+        "icao": icao,
+        "name": record.get("name") or record.get("airport") or "Aeroporto",
+        "city": record.get("city") or record.get("municipality") or "",
+        "country": record.get("country") or record.get("country_code") or "",
+        "lat": float(lat),
+        "lon": float(lon),
+    }
+
+
+def lookup_airport(code):
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+
+    if code in AIRPORT_FALLBACKS:
+        return AIRPORT_FALLBACKS[code]
+
+    by_iata, by_icao = load_airport_db()
+    if code in by_iata:
+        return normalize_airport_record(by_iata[code], fallback_code=code)
+    if code in by_icao:
+        return normalize_airport_record(by_icao[code], fallback_code=code)
+
+    return None
 
 
 def safe_float(value):
@@ -1075,6 +1170,8 @@ selected_place_index = 0
 manual_lat = None
 manual_lon = None
 manual_place_name = ""
+airport_code = ""
+airport_record = None
 
 with st.container(border=True):
     row0a, row0b = st.columns([1.25, 1.0])
@@ -1097,16 +1194,41 @@ with st.container(border=True):
     st.markdown("#### 1) Ponto de medição")
     location_mode = st.radio(
         "Como queres escolher o ponto?",
-        options=["Pesquisar e escolher resultado", "Coordenadas manuais"],
+        options=[LOCATION_AIRPORT, LOCATION_SEARCH, LOCATION_MANUAL],
         horizontal=True,
-        help="Usa coordenadas manuais quando o mercado resolve por aeroporto, estação específica, ICAO/IATA ou fonte oficial concreta.",
+        help="Se o mercado resolve por aeroporto, usa IATA/ICAO ou coordenadas manuais. Não uses a cidade genérica.",
     )
 
-    if location_mode == "Pesquisar e escolher resultado":
+    if location_mode == LOCATION_AIRPORT:
+        airport_code = st.text_input(
+            "Código IATA ou ICAO",
+            value="RKSI",
+            placeholder="Ex.: RKSI, ICN, RKSS, GMP, LIS, LPPT, JFK, KJFK",
+            help="Para Seoul: RKSI/ICN é Incheon; RKSS/GMP é Gimpo. São pontos diferentes de Seoul centro.",
+        ).strip().upper()
+
+        airport_record = lookup_airport(airport_code)
+        if airport_record:
+            st.success(f"Aeroporto usado: {airport_display_name(airport_record)}")
+            if airport_code in ["RKSI", "ICN"]:
+                st.warning(
+                    "Atenção: RKSI/ICN é Incheon Airport, numa ilha costeira a oeste de Seoul. "
+                    "Pode diferir bastante de Seoul centro e de Gimpo/RKSS. Confirma se o mercado resolve por RKSI/ICN ou por Seoul cidade."
+                )
+        else:
+            if airportsdata is None:
+                st.warning(
+                    "Não encontrei este código no fallback interno. Para cobertura global, adiciona `airportsdata` ao requirements.txt, "
+                    "ou usa coordenadas manuais."
+                )
+            else:
+                st.warning("Não encontrei esse código IATA/ICAO. Confirma o código ou usa coordenadas manuais.")
+
+    elif location_mode == LOCATION_SEARCH:
         city = st.text_input(
             "Cidade, aeroporto ou estação",
-            value="Lisboa Aeroporto",
-            placeholder="Ex.: Lisboa Aeroporto, Heathrow, JFK, Porto Airport, Zurich Airport",
+            value="Seoul",
+            placeholder="Ex.: Seoul, Incheon Airport, Gimpo Airport, Lisboa Aeroporto",
         )
 
         if city.strip():
@@ -1128,6 +1250,7 @@ with st.container(border=True):
                 st.caption("Sem resultados ainda. Tenta escrever também o país ou o nome do aeroporto.")
         else:
             st.caption("Escreve uma cidade, aeroporto ou estação para aparecerem resultados.")
+
     else:
         city = ""
         manual_place_name = st.text_input(
@@ -1141,20 +1264,20 @@ with st.container(border=True):
                 "Latitude",
                 min_value=-90.0,
                 max_value=90.0,
-                value=38.7742,
+                value=37.4691,
                 step=0.0001,
                 format="%.6f",
-                help="Exemplo: Lisboa Airport ≈ 38.7742",
+                help="Exemplo: RKSI/ICN ≈ 37.4691",
             )
         with coord2:
             manual_lon = st.number_input(
                 "Longitude",
                 min_value=-180.0,
                 max_value=180.0,
-                value=-9.1342,
+                value=126.4505,
                 step=0.0001,
                 format="%.6f",
-                help="Exemplo: Lisboa Airport ≈ -9.1342",
+                help="Exemplo: RKSI/ICN ≈ 126.4505",
             )
         st.caption("Dica: usa as coordenadas oficiais da estação/aeroporto indicado nas regras do mercado.")
 
@@ -1247,7 +1370,15 @@ if not selected_model_names:
     st.error("Seleciona pelo menos um modelo.")
     st.stop()
 
-if location_mode == "Pesquisar e escolher resultado":
+if location_mode == LOCATION_AIRPORT:
+    if not airport_record:
+        st.error("Não encontrei esse aeroporto. Usa IATA/ICAO correto ou coordenadas manuais.")
+        st.stop()
+    lat = float(airport_record["lat"])
+    lon = float(airport_record["lon"])
+    place_name = airport_display_name(airport_record)
+
+elif location_mode == LOCATION_SEARCH:
     if not city.strip():
         st.error("Escreve uma cidade, aeroporto ou estação.")
         st.stop()
@@ -1265,6 +1396,7 @@ if location_mode == "Pesquisar e escolher resultado":
     lat = float(place["latitude"])
     lon = float(place["longitude"])
     place_name = format_place_with_coords(place)
+
 else:
     lat = float(manual_lat)
     lon = float(manual_lon)
@@ -1336,7 +1468,13 @@ else:
     market_text = f"Tmax > {result['line_c']:.1f}°C"
     target_pill = f"Margem: {result['margin_c_yes']:+.1f}°C vs linha"
 
-st.caption(f"Local usado: **{place_name}** · Coordenadas: {lat:.4f}, {lon:.4f}")
+st.caption(f"Ponto de medição usado: **{place_name}**")
+with st.expander("Verificar ponto no mapa", expanded=False):
+    st.write(
+        f"Coordenadas usadas na previsão: **{lat:.6f}, {lon:.6f}**. "
+        "Se isto não coincide com a estação/aeroporto de resolução do mercado, a previsão pode ficar completamente errada."
+    )
+    st.map(pd.DataFrame([{"lat": lat, "lon": lon}]), latitude="lat", longitude="lon", zoom=9)
 
 st.markdown(
     f"""
@@ -1602,5 +1740,4 @@ with method_tab:
     st.warning(
         "Isto não é garantia de lucro nem recomendação financeira personalizada. Confirma sempre fonte oficial, estação usada, arredondamento, horário, unidade e regra exata de resolução do mercado."
     )
-
 
