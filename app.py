@@ -209,22 +209,45 @@ def safe_float(value):
         return None
 
 
-def parse_tmax(data, target_day):
-    daily = data.get("daily", {})
-    days = daily.get("time", [])
+def parse_hourly_tmax(data, target_day):
+    """
+    Calcula a Tmax manualmente a partir da série horária.
+
+    Isto é mais seguro para mercados/apostas do que pedir diretamente
+    daily=temperature_2m_max, porque garante que todos os modelos são
+    agregados com a mesma regra: máximo das horas locais do dia alvo.
+    """
+    hourly = data.get("hourly", {})
+    times = hourly.get("time", [])
     target = target_day.isoformat()
 
-    if target not in days:
-        return None
+    if not times:
+        return None, None
 
-    idx = days.index(target)
+    temp_keys = [
+        key for key, values in hourly.items()
+        if key.startswith("temperature_2m") and isinstance(values, list)
+    ]
 
-    for key, values in daily.items():
-        if key.startswith("temperature_2m_max") and isinstance(values, list):
-            if idx < len(values):
-                return safe_float(values[idx])
+    if not temp_keys:
+        return None, None
 
-    return None
+    best_tmax = None
+    best_time = None
+
+    for key in temp_keys:
+        values = hourly.get(key, [])
+        for t, value in zip(times, values):
+            if not str(t).startswith(target):
+                continue
+            temp = safe_float(value)
+            if temp is None:
+                continue
+            if best_tmax is None or temp > best_tmax:
+                best_tmax = temp
+                best_time = str(t)
+
+    return best_tmax, best_time
 
 
 @st.cache_data(ttl=20 * 60, show_spinner=False)
@@ -232,7 +255,7 @@ def fetch_model_forecast(lat, lon, target_day_str, model_name, model_code):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "daily": "temperature_2m_max",
+        "hourly": "temperature_2m",
         "timezone": "auto",
         "temperature_unit": "celsius",
         "start_date": target_day_str,
@@ -244,15 +267,16 @@ def fetch_model_forecast(lat, lon, target_day_str, model_name, model_code):
         params["models"] = model_code
 
     data = get_json(OPEN_METEO_FORECAST_URL, params=params)
-    tmax = parse_tmax(data, date.fromisoformat(target_day_str))
+    tmax, max_hour = parse_hourly_tmax(data, date.fromisoformat(target_day_str))
 
     if tmax is None:
-        raise RuntimeError("Sem temperature_2m_max para esta data/modelo.")
+        raise RuntimeError("Sem temperatura horária disponível para esta data/modelo.")
 
     return {
         "modelo": model_name,
         "codigo": model_code,
         "tmax": tmax,
+        "hora_max": max_hour or "",
         "peso": MODEL_WEIGHTS.get(model_code, 1.0),
     }
 
@@ -1525,7 +1549,7 @@ with models_tab:
     table["tmax"] = table["tmax"].round(2)
     table["peso"] = table["peso"].round(2)
     st.dataframe(
-        table.rename(columns={"modelo": "Modelo", "tmax": "Tmax °C", "peso": "Peso"})[["Modelo", "Tmax °C", "Peso"]],
+        table.rename(columns={"modelo": "Modelo", "tmax": "Tmax °C", "hora_max": "Hora local do máximo", "peso": "Peso"})[["Modelo", "Tmax °C", "Hora local do máximo", "Peso"]],
         hide_index=True,
         use_container_width=True,
     )
@@ -1570,6 +1594,7 @@ with method_tab:
         - O preço justo do **NO** é a probabilidade conservadora do evento contrário.
         - `edge = preço_justo - preço_de_mercado`.
         - A app desconta probabilidade quando há poucos modelos, data distante, dispersão elevada ou risco de resolução.
+        - A Tmax por modelo é calculada a partir da temperatura horária do próprio modelo, usando o máximo das horas locais do dia alvo.
         - O Monte Carlo adiciona ruído e caudas pesadas para evitar falsa precisão.
         """
     )
@@ -1577,5 +1602,4 @@ with method_tab:
     st.warning(
         "Isto não é garantia de lucro nem recomendação financeira personalizada. Confirma sempre fonte oficial, estação usada, arredondamento, horário, unidade e regra exata de resolução do mercado."
     )
-
 
