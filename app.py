@@ -1,159 +1,103 @@
-
-import math
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from statistics import NormalDist
-from zoneinfo import ZoneInfo
+import math
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 
-# ============================================================
-# CONFIGURAÇÃO
-# ============================================================
+# =========================
+# CONFIG
+# =========================
 
 st.set_page_config(
-    page_title="Weather Edge — Tmax Forecast",
+    page_title="Weather Edge",
     page_icon="🌡️",
-    layout="wide",
+    layout="centered",
 )
 
-APP_USER_AGENT = "weather-edge-streamlit/1.0"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
-VISUAL_CROSSING_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
-METNO_URL = "https://api.met.no/weatherapi/locationforecast/2.0/compact"
 
-MODEL_OPTIONS = {
-    "Open‑Meteo Best Match": "best_match",
-    "ECMWF IFS 0.25°": "ecmwf_ifs025",
-    "ECMWF AIFS 0.25°": "ecmwf_aifs025_single",
-    "NOAA/NCEP GFS Seamless": "gfs_seamless",
-    "DWD ICON Seamless": "icon_seamless",
-    "Météo‑France Seamless": "meteofrance_seamless",
-    "UK Met Office Seamless": "ukmo_seamless",
-    "GEM Canada Seamless": "gem_seamless",
-    "BOM ACCESS Global": "bom_access_global",
-    "MET Norway Seamless": "metno_seamless",
-    "MeteoSwiss ICON Seamless": "meteoswiss_icon_seamless",
+MODELS = {
+    "Open-Meteo Best Match": "best_match",
+    "ECMWF": "ecmwf_ifs025",
+    "GFS": "gfs_seamless",
+    "ICON": "icon_seamless",
+    "Météo-France": "meteofrance_seamless",
+    "UK Met Office": "ukmo_seamless",
 }
 
 MODEL_WEIGHTS = {
     "best_match": 1.20,
     "ecmwf_ifs025": 1.25,
-    "ecmwf_aifs025_single": 1.10,
     "gfs_seamless": 1.00,
     "icon_seamless": 1.05,
     "meteofrance_seamless": 1.05,
     "ukmo_seamless": 1.05,
-    "gem_seamless": 0.95,
-    "bom_access_global": 0.95,
-    "metno_seamless": 1.00,
-    "meteoswiss_icon_seamless": 1.00,
-    "visual_crossing": 1.00,
-    "metno_api": 0.95,
-}
-
-RISK_MULTIPLIERS = {
-    "Normal": 1.00,
-    "Conservador": 1.25,
-    "Muito conservador": 1.50,
 }
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+# =========================
+# API HELPERS
+# =========================
 
-def get_secret(name: str, default=None):
-    """Lê st.secrets sem rebentar localmente quando não existe secrets.toml."""
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return default
-
-
-def safe_float(value):
-    try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return None
-        return float(value)
-    except Exception:
-        return None
+@st.cache_data(ttl=30 * 60)
+def get_json(url, params=None):
+    r = requests.get(
+        url,
+        params=params,
+        headers={"User-Agent": "weather-edge-simple/1.0"},
+        timeout=25,
+    )
+    r.raise_for_status()
+    return r.json()
 
 
-def today_local() -> date:
-    return date.today()
-
-
-@st.cache_data(ttl=30 * 60, show_spinner=False)
-def get_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 25) -> dict:
-    hdrs = headers or {"User-Agent": APP_USER_AGENT}
-    response = requests.get(url, params=params, headers=hdrs, timeout=timeout)
-    if response.status_code != 200:
-        body = response.text[:500] if response.text else ""
-        raise RuntimeError(f"HTTP {response.status_code}: {body}")
-    return response.json()
-
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def geocode_city(city: str) -> list[dict]:
+@st.cache_data(ttl=24 * 60 * 60)
+def geocode_city(city):
     data = get_json(
         OPEN_METEO_GEOCODING_URL,
-        params={"name": city, "count": 10, "language": "pt", "format": "json"},
+        {
+            "name": city,
+            "count": 5,
+            "language": "pt",
+            "format": "json",
+        },
     )
     return data.get("results", []) or []
 
 
-def format_place(item: dict) -> str:
-    parts = [
-        item.get("name"),
-        item.get("admin1"),
-        item.get("country"),
-    ]
-    text = ", ".join([str(x) for x in parts if x])
-    lat = item.get("latitude")
-    lon = item.get("longitude")
-    return f"{text}  ({lat:.4f}, {lon:.4f})"
+def place_name(place):
+    parts = [place.get("name"), place.get("admin1"), place.get("country")]
+    return ", ".join([p for p in parts if p])
 
 
-def parse_open_meteo_daily_tmax(data: dict, target_day: date) -> float | None:
+def extract_tmax(data, target_day):
     daily = data.get("daily", {})
-    times = daily.get("time", [])
-    if not times:
+    days = daily.get("time", [])
+    temps = daily.get("temperature_2m_max", [])
+
+    if target_day.isoformat() not in days:
         return None
 
-    target_str = target_day.isoformat()
-    if target_str not in times:
+    idx = days.index(target_day.isoformat())
+    if idx >= len(temps):
         return None
 
-    idx = times.index(target_str)
+    value = temps[idx]
+    if value is None:
+        return None
 
-    # Com 1 modelo, a chave costuma ser temperature_2m_max.
-    # Com vários modelos, a API pode devolver sufixos por modelo.
-    candidate_keys = [
-        key for key, value in daily.items()
-        if key.startswith("temperature_2m_max") and isinstance(value, list)
-    ]
-
-    for key in candidate_keys:
-        values = daily.get(key, [])
-        if idx < len(values):
-            value = safe_float(values[idx])
-            if value is not None:
-                return value
-    return None
+    return float(value)
 
 
-@st.cache_data(ttl=20 * 60, show_spinner=False)
-def fetch_open_meteo_model(lat: float, lon: float, target_day_str: str, model_label: str, model_code: str) -> dict:
-    target_day = date.fromisoformat(target_day_str)
-
+@st.cache_data(ttl=20 * 60)
+def fetch_model_forecast(lat, lon, target_day_str, model_name, model_code):
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -168,627 +112,409 @@ def fetch_open_meteo_model(lat: float, lon: float, target_day_str: str, model_la
     if model_code != "best_match":
         params["models"] = model_code
 
-    data = get_json(OPEN_METEO_FORECAST_URL, params=params)
-    tmax = parse_open_meteo_daily_tmax(data, target_day)
+    data = get_json(OPEN_METEO_FORECAST_URL, params)
+    tmax = extract_tmax(data, date.fromisoformat(target_day_str))
 
     if tmax is None:
-        raise RuntimeError("Sem temperature_2m_max para este modelo/data.")
+        raise ValueError("sem temperatura máxima")
 
     return {
-        "provider": "Open‑Meteo",
-        "source": model_label,
-        "model_code": model_code,
-        "tmax_c": tmax,
-        "weight": MODEL_WEIGHTS.get(model_code, 1.0),
+        "modelo": model_name,
+        "codigo": model_code,
+        "tmax": tmax,
+        "peso": MODEL_WEIGHTS.get(model_code, 1.0),
     }
 
 
-@st.cache_data(ttl=20 * 60, show_spinner=False)
-def fetch_visual_crossing(lat: float, lon: float, target_day_str: str, api_key: str) -> dict:
-    location = f"{lat},{lon}"
-    url = f"{VISUAL_CROSSING_URL}/{location}/{target_day_str}/{target_day_str}"
-
-    data = get_json(
-        url,
-        params={
-            "key": api_key,
-            "unitGroup": "metric",
-            "include": "days",
-            "contentType": "json",
-            "lang": "pt",
-        },
-    )
-
-    days = data.get("days", [])
-    if not days:
-        raise RuntimeError("Visual Crossing não devolveu dados diários.")
-
-    tmax = safe_float(days[0].get("tempmax"))
-    if tmax is None:
-        raise RuntimeError("Visual Crossing não devolveu tempmax.")
-
-    return {
-        "provider": "Visual Crossing",
-        "source": "Visual Crossing Timeline",
-        "model_code": "visual_crossing",
-        "tmax_c": tmax,
-        "weight": MODEL_WEIGHTS["visual_crossing"],
-    }
+def circular_day_distance(a, b, days=366):
+    d = abs(a - b)
+    return min(d, days - d)
 
 
-@st.cache_data(ttl=20 * 60, show_spinner=False)
-def fetch_metno(lat: float, lon: float, target_day_str: str, timezone_name: str, user_agent: str) -> dict:
-    headers = {"User-Agent": user_agent}
-
-    data = get_json(
-        METNO_URL,
-        params={"lat": round(lat, 4), "lon": round(lon, 4)},
-        headers=headers,
-    )
-
-    tz = ZoneInfo(timezone_name or "UTC")
-    values = []
-
-    for item in data.get("properties", {}).get("timeseries", []):
-        raw_time = item.get("time")
-        if not raw_time:
-            continue
-
-        ts = datetime.fromisoformat(raw_time.replace("Z", "+00:00")).astimezone(tz)
-        if ts.date().isoformat() != target_day_str:
-            continue
-
-        temp = (
-            item.get("data", {})
-            .get("instant", {})
-            .get("details", {})
-            .get("air_temperature")
-        )
-        value = safe_float(temp)
-        if value is not None:
-            values.append(value)
-
-    if not values:
-        raise RuntimeError("MET Norway não tem pontos horários para essa data.")
-
-    return {
-        "provider": "MET Norway",
-        "source": "MET Norway Locationforecast",
-        "model_code": "metno_api",
-        "tmax_c": float(np.max(values)),
-        "weight": MODEL_WEIGHTS["metno_api"],
-    }
-
-
-def circular_doy_distance(a: int, b: int, days: int = 366) -> int:
-    diff = abs(a - b)
-    return min(diff, days - diff)
-
-
-@st.cache_data(ttl=12 * 60 * 60, show_spinner=False)
-def fetch_climatology(lat: float, lon: float, target_day_str: str, years_back: int, window_days: int) -> pd.DataFrame:
-    target_day = date.fromisoformat(target_day_str)
-    end_year = min(today_local().year - 1, target_day.year - 1)
-    start_year = max(1940, end_year - years_back + 1)
+@st.cache_data(ttl=12 * 60 * 60)
+def fetch_climate_reference(lat, lon, target_day_str):
+    """
+    Referência histórica simples:
+    últimos 15 anos, dias próximos da mesma altura do ano.
+    Usada só para evitar excesso de confiança.
+    """
+    target = date.fromisoformat(target_day_str)
+    end_year = min(date.today().year - 1, target.year - 1)
+    start_year = max(1940, end_year - 14)
 
     if end_year < start_year:
-        return pd.DataFrame(columns=["date", "tmax_c"])
+        return pd.DataFrame(columns=["date", "tmax"])
 
     data = get_json(
         OPEN_METEO_ARCHIVE_URL,
-        params={
+        {
             "latitude": lat,
             "longitude": lon,
             "start_date": f"{start_year}-01-01",
             "end_date": f"{end_year}-12-31",
             "daily": "temperature_2m_max",
-            "temperature_unit": "celsius",
             "timezone": "auto",
+            "temperature_unit": "celsius",
         },
-        timeout=35,
     )
 
     daily = data.get("daily", {})
-    dates = daily.get("time", [])
+    days = daily.get("time", [])
     temps = daily.get("temperature_2m_max", [])
 
-    if not dates or not temps:
-        return pd.DataFrame(columns=["date", "tmax_c"])
-
-    target_doy = target_day.timetuple().tm_yday
+    target_doy = target.timetuple().tm_yday
     rows = []
 
-    for d_str, temp in zip(dates, temps):
-        value = safe_float(temp)
-        if value is None:
+    for d_str, temp in zip(days, temps):
+        if temp is None:
             continue
 
         d = date.fromisoformat(d_str)
-        if circular_doy_distance(d.timetuple().tm_yday, target_doy) <= window_days:
-            rows.append({"date": d, "tmax_c": value})
+        if circular_day_distance(d.timetuple().tm_yday, target_doy) <= 10:
+            rows.append({"date": d, "tmax": float(temp)})
 
     return pd.DataFrame(rows)
 
 
-def weighted_mean_std(values: np.ndarray, weights: np.ndarray) -> tuple[float, float]:
-    if len(values) == 0:
-        return math.nan, math.nan
+# =========================
+# MATH
+# =========================
 
-    weights = np.asarray(weights, dtype=float)
-    values = np.asarray(values, dtype=float)
-    weights = np.where(weights <= 0, 1.0, weights)
+def weighted_stats(values, weights):
+    values = np.array(values, dtype=float)
+    weights = np.array(weights, dtype=float)
 
     mean = float(np.average(values, weights=weights))
 
-    if len(values) == 1:
+    if len(values) <= 1:
         return mean, 0.0
 
     variance = float(np.average((values - mean) ** 2, weights=weights))
-    return mean, math.sqrt(max(variance, 0.0))
+    spread = math.sqrt(max(variance, 0.0))
+
+    return mean, spread
 
 
-def forecast_rmse_floor(horizon_days: int) -> float:
+def forecast_error_floor(days_ahead):
     """
-    Piso de erro empírico simples para Tmax diária.
-    Não é uma validação oficial; serve para não confundir consenso aparente com certeza absoluta.
+    Piso conservador de erro para Tmax diária.
+    Quanto mais longe a data, maior a incerteza.
     """
-    h = max(0, horizon_days)
-    return 1.05 + 0.18 * h + (0.25 if h >= 5 else 0.0) + (0.25 if h >= 10 else 0.0)
+    return 1.15 + 0.20 * max(days_ahead, 0)
 
 
-def analyse_temperature(
-    forecasts: pd.DataFrame,
-    clim: pd.DataFrame,
-    target_day: date,
-    threshold_c: float,
-    risk_profile: str,
-) -> dict:
-    values = forecasts["tmax_c"].to_numpy(dtype=float)
-    weights = forecasts["weight"].to_numpy(dtype=float)
+def run_analysis(df, climate_df, target_day, line_temp, conservative=True):
+    mean, spread = weighted_stats(df["tmax"], df["peso"])
 
-    ensemble_mean, model_spread = weighted_mean_std(values, weights)
-    horizon_days = max(0, (target_day - today_local()).days)
+    days_ahead = max(0, (target_day - date.today()).days)
+    error_floor = forecast_error_floor(days_ahead)
 
-    clim_mean = None
-    clim_std = None
-    if not clim.empty:
-        clim_mean = float(clim["tmax_c"].mean())
-        clim_std = float(clim["tmax_c"].std(ddof=1)) if len(clim) > 1 else None
+    climate_mean = None
+    climate_std = None
 
-    # Shrink leve para climatologia quando a data está mais longe.
-    # Em dias próximos, a previsão domina. Em horizonte longo, a climatologia ganha algum peso.
-    if clim_mean is not None:
-        forecast_weight = 1.0 / (1.0 + (horizon_days / 18.0) ** 2)
-        posterior_mean = forecast_weight * ensemble_mean + (1.0 - forecast_weight) * clim_mean
+    if not climate_df.empty:
+        climate_mean = float(climate_df["tmax"].mean())
+        climate_std = float(climate_df["tmax"].std(ddof=1))
+
+        # Quanto mais longe a data, mais puxamos ligeiramente para a climatologia.
+        forecast_weight = 1 / (1 + (days_ahead / 18) ** 2)
+        final_mean = forecast_weight * mean + (1 - forecast_weight) * climate_mean
     else:
+        final_mean = mean
         forecast_weight = 1.0
-        posterior_mean = ensemble_mean
 
-    rmse_floor = forecast_rmse_floor(horizon_days)
-    seasonal_floor = 0.15 * clim_std if clim_std is not None and not math.isnan(clim_std) else 0.0
-    risk_multiplier = RISK_MULTIPLIERS.get(risk_profile, 1.0)
+    seasonal_uncertainty = 0
+    if climate_std is not None and not math.isnan(climate_std):
+        seasonal_uncertainty = 0.15 * climate_std
 
-    sigma = math.sqrt(model_spread**2 + rmse_floor**2 + seasonal_floor**2)
-    sigma = max(0.75, sigma * risk_multiplier)
+    sigma = math.sqrt(spread**2 + error_floor**2 + seasonal_uncertainty**2)
 
-    dist = NormalDist(mu=posterior_mean, sigma=sigma)
-    p_over = 1.0 - dist.cdf(threshold_c)
-    p_under = 1.0 - p_over
+    if conservative:
+        sigma *= 1.30
 
-    ci80 = (dist.inv_cdf(0.10), dist.inv_cdf(0.90))
-    ci90 = (dist.inv_cdf(0.05), dist.inv_cdf(0.95))
-    ci95 = (dist.inv_cdf(0.025), dist.inv_cdf(0.975))
+    sigma = max(sigma, 0.80)
 
-    consensus = "Alta"
-    if model_spread >= 2.0:
-        consensus = "Baixa"
-    elif model_spread >= 1.0:
-        consensus = "Média"
-
-    if len(forecasts) < 3:
-        consensus = "Baixa"
-
-    confidence_score = 100 * min(
-        1.0,
-        max(
-            0.0,
-            0.20
-            + 0.10 * min(len(forecasts), 5)
-            + 0.25 * (1.0 - min(model_spread / 3.0, 1.0))
-            + 0.20 * (1.0 - min(horizon_days / 16.0, 1.0))
-            + 0.15 * (1.0 - min(sigma / 5.0, 1.0)),
-        ),
-    )
+    dist = NormalDist(final_mean, sigma)
+    p_yes = 1 - dist.cdf(line_temp)
+    p_no = 1 - p_yes
 
     return {
-        "ensemble_mean": ensemble_mean,
-        "model_spread": model_spread,
-        "posterior_mean": posterior_mean,
+        "mean_models": mean,
+        "spread": spread,
+        "final_mean": final_mean,
         "sigma": sigma,
-        "rmse_floor": rmse_floor,
-        "seasonal_floor": seasonal_floor,
+        "p_yes": p_yes,
+        "p_no": p_no,
+        "ci_low": dist.inv_cdf(0.05),
+        "ci_high": dist.inv_cdf(0.95),
+        "days_ahead": days_ahead,
+        "climate_mean": climate_mean,
         "forecast_weight": forecast_weight,
-        "clim_mean": clim_mean,
-        "clim_std": clim_std,
-        "p_over": p_over,
-        "p_under": p_under,
-        "ci80": ci80,
-        "ci90": ci90,
-        "ci95": ci95,
-        "consensus": consensus,
-        "confidence_score": confidence_score,
-        "horizon_days": horizon_days,
     }
 
 
-def probability_label(p: float) -> str:
-    if p >= 0.90:
-        return "Muito alta"
-    if p >= 0.75:
-        return "Alta"
-    if p >= 0.60:
-        return "Moderada"
-    if p >= 0.40:
-        return "Incerta"
-    if p >= 0.25:
-        return "Baixa"
-    return "Muito baixa"
+def recommendation(p_yes, yes_price, spread, sigma):
+    fair_yes = p_yes
+    fair_no = 1 - p_yes
+    no_price = 1 - yes_price
+
+    edge_yes = fair_yes - yes_price
+    edge_no = fair_no - no_price
+
+    if sigma >= 4 or spread >= 2.5:
+        return "Evitar", "Incerteza demasiado alta entre os modelos.", edge_yes, edge_no
+
+    if fair_yes >= 0.85 and edge_yes >= 0.05:
+        return "YES", "Há margem estatística favorável para YES.", edge_yes, edge_no
+
+    if fair_no >= 0.85 and edge_no >= 0.05:
+        return "NO", "Há margem estatística favorável para NO.", edge_yes, edge_no
+
+    return "Evitar", "A probabilidade ou o preço não dão margem suficiente.", edge_yes, edge_no
 
 
-def build_distribution_chart(mu: float, sigma: float, threshold: float) -> go.Figure:
-    dist = NormalDist(mu=mu, sigma=sigma)
-    xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 300)
-    ys = np.array([dist.pdf(float(x)) for x in xs])
+# =========================
+# CHARTS
+# =========================
+
+def model_chart(df, final_mean, line_temp):
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=df["modelo"],
+            y=df["tmax"],
+            text=[f"{x:.1f}°" for x in df["tmax"]],
+            textposition="outside",
+            name="Previsão",
+        )
+    )
+
+    fig.add_hline(
+        y=final_mean,
+        line_dash="dash",
+        annotation_text="estimativa final",
+    )
+
+    fig.add_hline(
+        y=line_temp,
+        line_dash="dot",
+        annotation_text="linha do mercado",
+    )
+
+    fig.update_layout(
+        title="Modelos meteorológicos",
+        yaxis_title="Temperatura máxima prevista, °C",
+        xaxis_title="",
+        height=380,
+        margin=dict(l=10, r=10, t=60, b=10),
+        showlegend=False,
+    )
+
+    return fig
+
+
+def probability_chart(final_mean, sigma, line_temp):
+    dist = NormalDist(final_mean, sigma)
+    xs = np.linspace(final_mean - 4 * sigma, final_mean + 4 * sigma, 300)
+    ys = [dist.pdf(float(x)) for x in xs]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Distribuição estimada"))
-    fig.add_vline(x=mu, line_dash="dash", annotation_text="estimativa central")
-    fig.add_vline(x=threshold, line_dash="dot", annotation_text="linha do mercado")
+
+    fig.add_trace(
+        go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines",
+            name="Probabilidade",
+        )
+    )
+
+    fig.add_vline(
+        x=final_mean,
+        line_dash="dash",
+        annotation_text="estimativa",
+    )
+
+    fig.add_vline(
+        x=line_temp,
+        line_dash="dot",
+        annotation_text="linha",
+    )
+
     fig.update_layout(
-        title="Distribuição probabilística da temperatura máxima",
-        xaxis_title="Temperatura máxima diária (°C)",
+        title="Incerteza estimada",
+        xaxis_title="Temperatura máxima, °C",
         yaxis_title="Densidade",
-        height=380,
-        margin=dict(l=10, r=10, t=55, b=10),
+        height=340,
+        margin=dict(l=10, r=10, t=60, b=10),
+        showlegend=False,
     )
+
     return fig
 
 
-def build_sources_chart(forecasts: pd.DataFrame, posterior_mean: float) -> go.Figure:
-    df = forecasts.sort_values("tmax_c")
-    fig = px.bar(
-        df,
-        x="tmax_c",
-        y="source",
-        orientation="h",
-        hover_data=["provider", "weight"],
-        labels={"tmax_c": "Tmax prevista (°C)", "source": "Fonte/modelo"},
-        title="Comparação das previsões por modelo/fonte",
-    )
-    fig.add_vline(x=posterior_mean, line_dash="dash", annotation_text="estimativa final")
-    fig.update_layout(height=max(360, 42 * len(df)), margin=dict(l=10, r=10, t=55, b=10))
-    return fig
-
-
-def build_climatology_chart(clim: pd.DataFrame, target_forecast: float) -> go.Figure:
-    fig = px.histogram(
-        clim,
-        x="tmax_c",
-        nbins=30,
-        labels={"tmax_c": "Tmax histórica em janela sazonal (°C)"},
-        title="Climatologia histórica para a mesma época do ano",
-    )
-    fig.add_vline(x=target_forecast, line_dash="dash", annotation_text="estimativa atual")
-    fig.update_layout(height=350, margin=dict(l=10, r=10, t=55, b=10))
-    return fig
-
-
-# ============================================================
+# =========================
 # UI
-# ============================================================
+# =========================
 
-st.title("🌡️ Weather Edge — previsão de temperatura máxima")
-st.caption(
-    "Agrega vários modelos meteorológicos, estima incerteza e calcula a probabilidade de a temperatura máxima ultrapassar uma linha."
-)
+st.title("🌡️ Weather Edge")
+st.write("Previsão simples da temperatura máxima para comparar com uma linha de mercado.")
 
-with st.expander("⚠️ Nota importante sobre apostas e risco", expanded=False):
-    st.write(
-        """
-        Esta app é uma ferramenta estatística, não uma garantia de lucro. Mesmo uma probabilidade estimada de 90% ainda implica risco.
-        O objetivo é reduzir decisões impulsivas: comparar fontes, quantificar incerteza e evitar mercados sem margem clara.
-        Não automatiza compras/vendas no Polymarket.
-        """
-    )
-
-with st.sidebar:
-    st.header("Parâmetros")
-
+with st.form("inputs"):
     city = st.text_input("Cidade", value="Lisboa")
-    min_day = today_local()
-    max_day = min_day + timedelta(days=16)
-    target_day = st.date_input(
-        "Dia do mercado",
-        value=min_day + timedelta(days=3),
-        min_value=min_day,
-        max_value=max_day,
-        help="Open‑Meteo normalmente permite previsões até 16 dias. Algumas fontes opcionais têm horizontes menores.",
-    )
 
-    threshold_c = st.number_input(
-        "Linha do mercado Polymarket: Tmax ≥ X °C",
-        value=25.0,
-        step=0.5,
-        format="%.1f",
-    )
+    col_a, col_b = st.columns(2)
 
-    yes_price = st.number_input(
-        "Preço YES no mercado, opcional",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.50,
-        step=0.01,
-        help="Se não quiseres analisar edge/preço, deixa em 0.50.",
-    )
+    with col_a:
+        target_day = st.date_input(
+            "Dia",
+            value=date.today() + timedelta(days=3),
+            min_value=date.today(),
+            max_value=date.today() + timedelta(days=16),
+        )
 
-    risk_profile = st.selectbox(
-        "Perfil de incerteza",
-        options=list(RISK_MULTIPLIERS.keys()),
-        index=1,
-        help="Conservador aumenta a largura dos intervalos e evita excesso de confiança.",
-    )
+    with col_b:
+        line_temp = st.number_input(
+            "Linha do mercado, °C",
+            value=25.0,
+            step=0.5,
+        )
 
-    st.subheader("Modelos Open‑Meteo")
-    default_models = [
-        "Open‑Meteo Best Match",
-        "ECMWF IFS 0.25°",
-        "NOAA/NCEP GFS Seamless",
-        "DWD ICON Seamless",
-        "Météo‑France Seamless",
-        "UK Met Office Seamless",
-    ]
+    col_c, col_d = st.columns(2)
 
-    selected_labels = st.multiselect(
-        "Seleciona modelos",
-        options=list(MODEL_OPTIONS.keys()),
-        default=default_models,
-    )
+    with col_c:
+        yes_price = st.number_input(
+            "Preço YES",
+            min_value=0.01,
+            max_value=0.99,
+            value=0.50,
+            step=0.01,
+        )
 
-    st.subheader("Fontes opcionais")
-    use_visual_crossing = st.checkbox("Usar Visual Crossing se houver secret", value=False)
-    use_metno = st.checkbox("Usar MET Norway Locationforecast se houver User‑Agent", value=False)
+    with col_d:
+        conservative = st.toggle(
+            "Modo conservador",
+            value=True,
+            help="Aumenta a incerteza para reduzir excesso de confiança.",
+        )
 
-    vc_key_secret = get_secret("VISUAL_CROSSING_KEY", "")
-    metno_user_agent_secret = get_secret("METNO_USER_AGENT", "")
+    submitted = st.form_submit_button("Analisar", type="primary", use_container_width=True)
 
-    vc_key = st.text_input(
-        "VISUAL_CROSSING_KEY",
-        value=vc_key_secret,
-        type="password",
-        help="Opcional. Em produção, usa .streamlit/secrets.toml.",
-    )
-
-    metno_user_agent = st.text_input(
-        "METNO_USER_AGENT",
-        value=metno_user_agent_secret,
-        help="Ex.: weather-edge/1.0 teuemail@dominio.com",
-    )
-
-    st.subheader("Climatologia")
-    years_back = st.slider("Anos históricos", min_value=5, max_value=30, value=15, step=1)
-    window_days = st.slider("Janela sazonal ± dias", min_value=3, max_value=21, value=10, step=1)
-
-    run = st.button("Calcular", type="primary")
-
-
-if not run:
-    st.info("Escolhe a cidade, a data e a linha do mercado; depois clica em **Calcular**.")
+if not submitted:
     st.stop()
-
-
-# ============================================================
-# EXECUÇÃO
-# ============================================================
 
 if not city.strip():
     st.error("Escreve uma cidade.")
     st.stop()
 
 try:
-    matches = geocode_city(city.strip())
-except Exception as exc:
-    st.error(f"Erro no geocoding: {exc}")
+    places = geocode_city(city.strip())
+except Exception as e:
+    st.error(f"Erro ao procurar cidade: {e}")
     st.stop()
 
-if not matches:
-    st.error("Não encontrei essa cidade. Tenta escrever também o país, por exemplo: 'Porto, Portugal'.")
+if not places:
+    st.error("Não encontrei essa cidade. Tenta escrever também o país.")
     st.stop()
 
-place = st.selectbox(
-    "Localização encontrada",
-    options=matches,
-    format_func=format_place,
-)
-
+place = places[0]
 lat = float(place["latitude"])
 lon = float(place["longitude"])
-timezone_name = place.get("timezone") or "UTC"
 
-st.write(f"**Local usado:** {format_place(place)}")
-st.write(f"**Timezone:** {timezone_name} | **Data alvo:** {target_day.isoformat()}")
+st.caption(f"Local usado: {place_name(place)}")
 
-warnings = []
-records = []
+rows = []
+errors = []
 
-progress = st.progress(0, text="A obter previsões...")
+with st.spinner("A calcular previsões..."):
+    for model_name, model_code in MODELS.items():
+        try:
+            rows.append(
+                fetch_model_forecast(
+                    lat,
+                    lon,
+                    target_day.isoformat(),
+                    model_name,
+                    model_code,
+                )
+            )
+        except Exception as e:
+            errors.append(f"{model_name}: {e}")
 
-tasks = [(label, MODEL_OPTIONS[label]) for label in selected_labels]
-total_tasks = len(tasks) + int(use_visual_crossing) + int(use_metno)
+    try:
+        climate_df = fetch_climate_reference(lat, lon, target_day.isoformat())
+    except Exception:
+        climate_df = pd.DataFrame(columns=["date", "tmax"])
 
-if total_tasks == 0:
-    st.error("Seleciona pelo menos uma fonte/modelo.")
+if len(rows) < 2:
+    st.error("Não consegui obter modelos suficientes para uma análise útil.")
+    if errors:
+        with st.expander("Erros"):
+            for err in errors:
+                st.write(err)
     st.stop()
 
-completed = 0
-
-for label, code in tasks:
-    try:
-        record = fetch_open_meteo_model(lat, lon, target_day.isoformat(), label, code)
-        records.append(record)
-    except Exception as exc:
-        warnings.append(f"{label}: {exc}")
-    completed += 1
-    progress.progress(completed / total_tasks, text="A obter previsões...")
-
-if use_visual_crossing:
-    if vc_key.strip():
-        try:
-            records.append(fetch_visual_crossing(lat, lon, target_day.isoformat(), vc_key.strip()))
-        except Exception as exc:
-            warnings.append(f"Visual Crossing: {exc}")
-    else:
-        warnings.append("Visual Crossing ignorado: falta VISUAL_CROSSING_KEY.")
-    completed += 1
-    progress.progress(completed / total_tasks, text="A obter previsões...")
-
-if use_metno:
-    if metno_user_agent.strip() and "email" not in metno_user_agent.lower():
-        try:
-            records.append(fetch_metno(lat, lon, target_day.isoformat(), timezone_name, metno_user_agent.strip()))
-        except Exception as exc:
-            warnings.append(f"MET Norway: {exc}")
-    else:
-        warnings.append("MET Norway ignorado: falta User‑Agent válido com contacto.")
-    completed += 1
-    progress.progress(completed / total_tasks, text="A obter previsões...")
-
-progress.empty()
-
-if not records:
-    st.error("Nenhuma fonte devolveu previsão utilizável. Experimenta menos modelos ou outra data.")
-    if warnings:
-        with st.expander("Detalhes dos erros"):
-            for warning in warnings:
-                st.write(f"- {warning}")
-    st.stop()
-
-forecasts = pd.DataFrame(records)
-
-with st.spinner("A obter climatologia histórica..."):
-    try:
-        clim = fetch_climatology(lat, lon, target_day.isoformat(), years_back, window_days)
-    except Exception as exc:
-        clim = pd.DataFrame(columns=["date", "tmax_c"])
-        warnings.append(f"Climatologia histórica: {exc}")
-
-analysis = analyse_temperature(forecasts, clim, target_day, threshold_c, risk_profile)
-
-# ============================================================
-# RESULTADOS
-# ============================================================
-
-st.subheader("Resultado principal")
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Tmax estimada", f"{analysis['posterior_mean']:.1f} °C")
-col2.metric("Prob. Tmax ≥ linha", f"{100 * analysis['p_over']:.1f}%")
-col3.metric("Intervalo 90%", f"{analysis['ci90'][0]:.1f}–{analysis['ci90'][1]:.1f} °C")
-col4.metric("Concordância", analysis["consensus"])
-
-yes_fair = analysis["p_over"]
-no_fair = analysis["p_under"]
-edge_yes = yes_fair - yes_price
-edge_no = no_fair - (1.0 - yes_price)
-
-st.markdown("### Leitura para mercado binário")
-
-mcol1, mcol2, mcol3 = st.columns(3)
-mcol1.metric("Preço justo YES", f"{yes_fair:.3f}")
-mcol2.metric("Edge YES vs preço", f"{edge_yes:+.3f}")
-mcol3.metric("Edge NO vs preço implícito", f"{edge_no:+.3f}")
-
-p_label = probability_label(yes_fair)
-st.write(
-    f"Com a linha **Tmax ≥ {threshold_c:.1f} °C**, a probabilidade estimada do **YES** é "
-    f"**{100 * yes_fair:.1f}%** ({p_label.lower()})."
+df = pd.DataFrame(rows)
+result = run_analysis(df, climate_df, target_day, line_temp, conservative)
+pick, reason, edge_yes, edge_no = recommendation(
+    result["p_yes"],
+    yes_price,
+    result["spread"],
+    result["sigma"],
 )
 
-if yes_fair >= 0.85 and edge_yes >= 0.05 and analysis["consensus"] != "Baixa":
-    st.success(
-        "Sinal estatístico forte para YES, segundo estes dados. Mesmo assim, confirma regras de resolução, liquidez, spread e hora/local da medição."
-    )
-elif no_fair >= 0.85 and edge_no >= 0.05 and analysis["consensus"] != "Baixa":
-    st.success(
-        "Sinal estatístico forte para NO, segundo estes dados. Mesmo assim, confirma regras de resolução, liquidez, spread e hora/local da medição."
-    )
-elif analysis["consensus"] == "Baixa" or analysis["sigma"] >= 3.5:
-    st.warning(
-        "Risco elevado: há dispersão relevante entre modelos ou incerteza ampla. Evita tratar isto como aposta de baixo risco."
-    )
+# =========================
+# TOP RESULT
+# =========================
+
+st.divider()
+
+if pick == "YES":
+    st.success(f"Conclusão: **YES** — {reason}")
+elif pick == "NO":
+    st.success(f"Conclusão: **NO** — {reason}")
 else:
-    st.info(
-        "Sinal moderado/indefinido. A margem estatística pode não compensar spread, taxas, liquidez ou erro de resolução do mercado."
-    )
+    st.warning(f"Conclusão: **EVITAR** — {reason}")
 
-st.markdown("### Diagnóstico matemático")
+k1, k2, k3 = st.columns(3)
 
-dcol1, dcol2, dcol3, dcol4 = st.columns(4)
-dcol1.metric("Média ponderada modelos", f"{analysis['ensemble_mean']:.1f} °C")
-dcol2.metric("Dispersão entre modelos", f"{analysis['model_spread']:.2f} °C")
-dcol3.metric("Sigma final", f"{analysis['sigma']:.2f} °C")
-dcol4.metric("Score técnico", f"{analysis['confidence_score']:.0f}/100")
+k1.metric("Tmax estimada", f"{result['final_mean']:.1f} °C")
+k2.metric("Prob. YES", f"{100 * result['p_yes']:.1f}%")
+k3.metric("Intervalo 90%", f"{result['ci_low']:.1f}–{result['ci_high']:.1f} °C")
 
-with st.expander("Como a conta é feita"):
-    st.markdown(
-        f"""
-        1. Cada modelo/fonte dá uma previsão de **Tmax**.
-        2. Calcula-se uma média ponderada dos modelos.
-        3. Mede-se a dispersão entre fontes.
-        4. Soma-se um piso de erro por horizonte temporal: **{analysis['rmse_floor']:.2f} °C**.
-        5. Se houver climatologia, aplica-se uma correção leve para a média histórica da época:
-           peso da previsão = **{100 * analysis['forecast_weight']:.1f}%**.
-        6. Assume-se uma distribuição normal aproximada para obter probabilidades e intervalos.
+e1, e2, e3 = st.columns(3)
 
-        Isto é deliberadamente conservador: a incerteza final mistura discordância entre modelos,
-        erro mínimo esperado e variabilidade histórica sazonal.
-        """
-    )
+e1.metric("Preço justo YES", f"{result['p_yes']:.3f}")
+e2.metric("Edge YES", f"{edge_yes:+.3f}")
+e3.metric("Edge NO", f"{edge_no:+.3f}")
 
-tab1, tab2, tab3 = st.tabs(["Gráficos", "Tabela de fontes", "Avisos"])
+st.write(
+    f"A linha é **{line_temp:.1f} °C**. "
+    f"A app estima **{100 * result['p_yes']:.1f}%** de probabilidade de a temperatura máxima ser igual ou superior à linha."
+)
 
-with tab1:
-    st.plotly_chart(build_sources_chart(forecasts, analysis["posterior_mean"]), use_container_width=True)
-    st.plotly_chart(build_distribution_chart(analysis["posterior_mean"], analysis["sigma"], threshold_c), use_container_width=True)
+st.plotly_chart(model_chart(df, result["final_mean"], line_temp), use_container_width=True)
+st.plotly_chart(probability_chart(result["final_mean"], result["sigma"], line_temp), use_container_width=True)
 
-    if not clim.empty:
-        st.plotly_chart(build_climatology_chart(clim, analysis["posterior_mean"]), use_container_width=True)
-    else:
-        st.info("Sem climatologia histórica disponível para este local/janela.")
+with st.expander("Ver detalhes técnicos"):
+    details = df.copy()
+    details["tmax"] = details["tmax"].round(2)
+    st.dataframe(details[["modelo", "tmax"]], hide_index=True, use_container_width=True)
 
-with tab2:
-    table = forecasts.copy()
-    table["tmax_c"] = table["tmax_c"].round(2)
-    table["weight"] = table["weight"].round(2)
-    st.dataframe(
-        table[["provider", "source", "model_code", "tmax_c", "weight"]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.write(f"Média dos modelos: **{result['mean_models']:.1f} °C**")
+    st.write(f"Dispersão entre modelos: **{result['spread']:.2f} °C**")
+    st.write(f"Incerteza final: **{result['sigma']:.2f} °C**")
+    st.write(f"Dias até ao evento: **{result['days_ahead']}**")
 
-    if not clim.empty:
-        st.write(
-            f"Climatologia usada: **{len(clim)}** observações históricas; "
-            f"média **{clim['tmax_c'].mean():.1f} °C**, "
-            f"desvio-padrão **{clim['tmax_c'].std(ddof=1):.1f} °C**."
-        )
+    if result["climate_mean"] is not None:
+        st.write(f"Média histórica da época do ano: **{result['climate_mean']:.1f} °C**")
 
-with tab3:
-    if warnings:
-        for warning in warnings:
-            st.warning(warning)
-    else:
-        st.success("Sem avisos das fontes.")
+    if errors:
+        st.write("Modelos que falharam:")
+        for err in errors:
+            st.write(f"- {err}")
 
 st.caption(
-    "Uso responsável: esta app não prevê eventos extremos locais perfeitamente e não substitui a leitura das regras exatas do mercado."
+    "Isto é uma estimativa estatística, não uma garantia. Confirma sempre as regras exatas do mercado antes de apostar."
 )
