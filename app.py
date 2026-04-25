@@ -181,6 +181,23 @@ def format_place(place):
     return ", ".join([str(p) for p in parts if p])
 
 
+def format_place_with_coords(place):
+    name = format_place(place)
+    lat = place.get("latitude")
+    lon = place.get("longitude")
+    elevation = place.get("elevation")
+
+    coord_text = ""
+    if lat is not None and lon is not None:
+        coord_text = f" · {float(lat):.4f}, {float(lon):.4f}"
+
+    elev_text = ""
+    if elevation is not None:
+        elev_text = f" · {float(elevation):.0f} m"
+
+    return f"{name}{coord_text}{elev_text}"
+
+
 def safe_float(value):
     try:
         if value is None:
@@ -1022,12 +1039,18 @@ st.markdown(
         <h1>🌡️ Weather Edge Pro</h1>
         <div class="muted">
             Semáforo para mercados de temperatura máxima: modo temperatura específica ou modo maior que/acima da linha.
-            Compara modelos meteorológicos, climatologia, incerteza, Monte Carlo, stress tests e edge vs preço.
+            Permite escolher cidade, aeroporto, estação ou coordenadas manuais do ponto de resolução.
         </div>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
+places_preview = []
+selected_place_index = 0
+manual_lat = None
+manual_lon = None
+manual_place_name = ""
 
 with st.container(border=True):
     row0a, row0b = st.columns([1.25, 1.0])
@@ -1047,15 +1070,78 @@ with st.container(border=True):
             step=0.01,
         )
 
-    if market_mode == MARKET_EXACT:
-        top1, top2, top3, top4 = st.columns([1.55, 1.0, 0.95, 0.95])
+    st.markdown("#### 1) Ponto de medição")
+    location_mode = st.radio(
+        "Como queres escolher o ponto?",
+        options=["Pesquisar e escolher resultado", "Coordenadas manuais"],
+        horizontal=True,
+        help="Usa coordenadas manuais quando o mercado resolve por aeroporto, estação específica, ICAO/IATA ou fonte oficial concreta.",
+    )
+
+    if location_mode == "Pesquisar e escolher resultado":
+        city = st.text_input(
+            "Cidade, aeroporto ou estação",
+            value="Lisboa Aeroporto",
+            placeholder="Ex.: Lisboa Aeroporto, Heathrow, JFK, Porto Airport, Zurich Airport",
+        )
+
+        if city.strip():
+            try:
+                places_preview = geocode_city(city.strip())
+            except Exception as exc:
+                places_preview = []
+                st.warning(f"Não consegui pesquisar ainda: {exc}")
+
+            if places_preview:
+                selected_place_index = st.selectbox(
+                    "Escolhe o resultado exato",
+                    options=list(range(len(places_preview))),
+                    format_func=lambda i: format_place_with_coords(places_preview[i]),
+                    index=0,
+                    help="Confirma que o ponto corresponde ao aeroporto/estação usado nas regras do mercado.",
+                )
+            else:
+                st.caption("Sem resultados ainda. Tenta escrever também o país ou o nome do aeroporto.")
+        else:
+            st.caption("Escreve uma cidade, aeroporto ou estação para aparecerem resultados.")
     else:
-        top1, top2, top3 = st.columns([1.55, 1.0, 1.0])
+        city = ""
+        manual_place_name = st.text_input(
+            "Nome do ponto",
+            value="Aeroporto / estação manual",
+            help="Só serve para aparecer no relatório; a previsão usa as coordenadas abaixo.",
+        )
+        coord1, coord2 = st.columns(2)
+        with coord1:
+            manual_lat = st.number_input(
+                "Latitude",
+                min_value=-90.0,
+                max_value=90.0,
+                value=38.7742,
+                step=0.0001,
+                format="%.6f",
+                help="Exemplo: Lisboa Airport ≈ 38.7742",
+            )
+        with coord2:
+            manual_lon = st.number_input(
+                "Longitude",
+                min_value=-180.0,
+                max_value=180.0,
+                value=-9.1342,
+                step=0.0001,
+                format="%.6f",
+                help="Exemplo: Lisboa Airport ≈ -9.1342",
+            )
+        st.caption("Dica: usa as coordenadas oficiais da estação/aeroporto indicado nas regras do mercado.")
+
+    st.markdown("#### 2) Mercado")
+
+    if market_mode == MARKET_EXACT:
+        top1, top2, top3 = st.columns([1.0, 0.95, 0.95])
+    else:
+        top1, top2 = st.columns([1.0, 1.0])
 
     with top1:
-        city = st.text_input("Cidade", value="Lisboa", placeholder="Ex.: Lisboa, Portugal")
-
-    with top2:
         target_day = st.date_input(
             "Dia",
             value=date.today() + timedelta(days=3),
@@ -1064,7 +1150,7 @@ with st.container(border=True):
         )
 
     if market_mode == MARKET_EXACT:
-        with top3:
+        with top2:
             target_temp_c = st.number_input(
                 "Temperatura alvo",
                 value=25.0,
@@ -1072,7 +1158,7 @@ with st.container(border=True):
                 format="%.1f",
                 help="Ex.: se o mercado é 'Tmax será 25°C', escreve 25.",
             )
-        with top4:
+        with top3:
             half_width_c = st.number_input(
                 "Bucket ± °C",
                 min_value=0.01,
@@ -1086,7 +1172,7 @@ with st.container(border=True):
             f"Interpretação atual: YES ganha se a Tmax ficar entre **{target_temp_c - half_width_c:.2f}°C** e **{target_temp_c + half_width_c:.2f}°C**."
         )
     else:
-        with top3:
+        with top2:
             line_c = st.number_input(
                 "Linha: Tmax maior que X °C",
                 value=25.0,
@@ -1133,25 +1219,33 @@ if not calculate:
     st.info("Escolhe o tipo de mercado, preenche cidade, dia, linha/alvo e preço YES. Depois clica em **Analisar mercado**.")
     st.stop()
 
-if not city.strip():
-    st.error("Escreve uma cidade.")
-    st.stop()
-
 if not selected_model_names:
     st.error("Seleciona pelo menos um modelo.")
     st.stop()
 
-with st.spinner("A encontrar a cidade..."):
-    places = geocode_city(city.strip())
+if location_mode == "Pesquisar e escolher resultado":
+    if not city.strip():
+        st.error("Escreve uma cidade, aeroporto ou estação.")
+        st.stop()
 
-if not places:
-    st.error("Não encontrei essa cidade. Experimenta escrever também o país, por exemplo: 'Porto, Portugal'.")
-    st.stop()
+    if not places_preview:
+        with st.spinner("A encontrar o ponto de medição..."):
+            places_preview = geocode_city(city.strip())
 
-place = places[0]
-lat = float(place["latitude"])
-lon = float(place["longitude"])
-place_name = format_place(place)
+    if not places_preview:
+        st.error("Não encontrei esse ponto. Tenta escrever também o país ou usa coordenadas manuais.")
+        st.stop()
+
+    selected_place_index = min(int(selected_place_index), len(places_preview) - 1)
+    place = places_preview[selected_place_index]
+    lat = float(place["latitude"])
+    lon = float(place["longitude"])
+    place_name = format_place_with_coords(place)
+else:
+    lat = float(manual_lat)
+    lon = float(manual_lon)
+    place_name = manual_place_name.strip() or "Coordenadas manuais"
+    place_name = f"{place_name} · {lat:.4f}, {lon:.4f}"
 
 records = []
 errors = []
